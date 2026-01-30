@@ -493,67 +493,37 @@ def format_mac(mac):
 
 def load_oui_db():
     db = {}
-    candidates = [
-        Path(__file__).parent / "oui.txt",
-        Path(__file__).parent / "oui.csv",
-    ]
-    brew_root = Path("/opt/homebrew/Cellar/nmap")
-    if brew_root.exists():
-        for ver_dir in sorted(brew_root.iterdir(), reverse=True):
-            nmap_file = ver_dir / "share" / "nmap" / "nmap-mac-prefixes"
-            if nmap_file.exists():
-                candidates.append(nmap_file)
-                break
-
-    path = next((p for p in candidates if p.exists()), None)
-    if not path:
+    path = Path(__file__).parent / "ouidb.txt"
+    if not path.exists():
         return db
-
     try:
         text = path.read_text(errors="ignore")
     except Exception:
         return db
-
     for line in text.splitlines():
         line = line.strip()
-        if not line or line.startswith("#"):
+        if not line:
             continue
-        if "," in line and "(base 16)" not in line:
-            parts = line.split(",", 1)
-            if len(parts) == 2:
-                oui = parts[0].strip().replace("-", ":").upper()
-                vendor = parts[1].strip()
-                if len(oui) >= 8 and vendor:
-                    db[oui[:8]] = vendor
+        parts = line.split(" ", 1)
+        if len(parts) != 2:
             continue
-        if "(base 16)" in line:
-            left, right = line.split("(base 16)", 1)
-            oui = left.strip().replace("-", ":").upper()
-            vendor = right.strip()
-            if len(oui) >= 8 and vendor:
-                db[oui[:8]] = vendor
-            continue
-        if "\t" in line or " " in line:
-            if "\t" in line:
-                left, right = line.split("\t", 1)
-            else:
-                left, right = line.split(" ", 1)
-            oui = left.strip()
-            vendor = right.strip()
-            if len(oui) >= 6 and vendor:
-                if len(oui) == 6:
-                    oui = ":".join([oui[i:i+2] for i in range(0, 6, 2)])
-                db[oui[:8].upper()] = vendor
+        prefix = parts[0].strip().upper()
+        vendor = parts[1].strip()
+        if prefix and vendor:
+            db[prefix] = vendor
     return db
 
 
 def vendor_for_mac(mac, oui_db):
     if not mac:
         return ""
-    prefix = format_mac(mac)[:8]
-    vendor = oui_db.get(prefix, "")
-    if vendor:
-        return vendor
+    raw = format_mac(mac).replace(":", "")
+    for length in (9, 7, 6):
+        if len(raw) >= length:
+            prefix = raw[:length]
+            vendor = oui_db.get(prefix, "")
+            if vendor:
+                return vendor
     try:
         first_byte = int(format_mac(mac)[:2], 16)
         ig = "multicast" if (first_byte & 0x01) else "unicast"
@@ -905,9 +875,13 @@ class NetViewQt(QtWidgets.QMainWindow):
                 item = QtGui.QStandardItem(str(val))
                 if col == 3:
                     item.setFont(self.mono_font)
+                if col == 4 and str(val).startswith("(") and str(val).endswith(")"):
+                    item.setForeground(QtGui.QBrush(QtGui.QColor("#6E6E73")))
                 self.model.setItem(row, col, item)
             else:
                 item.setText(str(val))
+                if col == 4 and str(val).startswith("(") and str(val).endswith(")"):
+                    item.setForeground(QtGui.QBrush(QtGui.QColor("#6E6E73")))
         self.update_web_column(row)
         self.view.sortByColumn(0, QtCore.Qt.AscendingOrder)
         self.view.resizeColumnsToContents()
@@ -918,7 +892,7 @@ class NetViewQt(QtWidgets.QMainWindow):
         row = self._rows.get(ip)
         if row is None:
             return
-        ports_text = ",".join(str(p) for p in ports) if ports else "-"
+        ports_text = ",".join(str(p) for p in ports) if ports else ""
         item = self.model.item(row, 5)
         if item is None:
             item = QtGui.QStandardItem(ports_text)
@@ -946,7 +920,10 @@ class NetViewQt(QtWidgets.QMainWindow):
             if vendor:
                 v_item = self.model.item(row, 4)
                 if v_item is None or not v_item.text():
-                    self.model.setItem(row, 4, QtGui.QStandardItem(vendor))
+                    v_item = QtGui.QStandardItem(vendor)
+                    if vendor.startswith("(") and vendor.endswith(")"):
+                        v_item.setForeground(QtGui.QBrush(QtGui.QColor("#6E6E73")))
+                    self.model.setItem(row, 4, v_item)
         self.update_web_column(row)
 
     def apply_name(self, ip, name):
