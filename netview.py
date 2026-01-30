@@ -42,13 +42,15 @@ def iter_subnet_hosts(ip_str, prefix=24):
         net = ipaddress.ip_network(f"{ip_str}/{prefix}", strict=False)
     except ValueError:
         return []
-    return [str(h) for h in net.hosts()]
+    return [str(h) for h in net.hosts() if h.packed[-1] != 0]
 
 
 def should_include_ip(ip, net=None):
     try:
         addr = ipaddress.ip_address(ip)
     except ValueError:
+        return False
+    if addr.packed[-1] == 0:
         return False
     if addr.is_multicast:
         return False
@@ -686,12 +688,17 @@ class ScanWorker(QtCore.QObject):
         hosts = iter_subnet_hosts(local_ip, prefix=24)
         targets = [ip for ip in hosts if ip != local_ip and should_include_ip(ip, net)]
         found = set()
-
         def enqueue_work(ip, want_name=True, want_ports=True):
             if ip in self._queued:
                 return
             self._queued.add(ip)
             self._work_q.put((ip, want_name, want_ports))
+
+        # Add local machine immediately and enqueue checks
+        local_name = f"{socket.gethostname()} (this machine)"
+        self.upsert.emit(local_ip, local_name, "", "Pending")
+        found.add(local_ip)
+        enqueue_work(local_ip, want_name=False, want_ports=True)
 
         arp = parse_arp_table()
         for ip, entry in arp.items():
@@ -794,6 +801,9 @@ class NetViewQt(QtWidgets.QMainWindow):
 
         self.tabs = QtWidgets.QTabWidget()
         layout.addWidget(self.tabs)
+        self._tab_index_status = None
+        self._tab_index_devices = None
+        self._tab_index_tasmota = None
 
         self.model = QtGui.QStandardItemModel(0, 6, self)
         self.model.setHorizontalHeaderLabels(
@@ -870,7 +880,7 @@ class NetViewQt(QtWidgets.QMainWindow):
         self.status_view.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.status_view.customContextMenuRequested.connect(self.show_table_context_menu)
         status_layout.addWidget(self.status_view)
-        self.tabs.addTab(status_tab, "Network Status")
+        self._tab_index_status = self.tabs.addTab(status_tab, "Network Status")
 
         tasmota_tab = QtWidgets.QWidget()
         tasmota_layout = QtWidgets.QVBoxLayout(tasmota_tab)
@@ -916,21 +926,27 @@ class NetViewQt(QtWidgets.QMainWindow):
         tasmota_layout.addWidget(self.tasmota_view)
         devices_tab = QtWidgets.QWidget()
         devices_layout = QtWidgets.QVBoxLayout(devices_tab)
-        devices_layout.setContentsMargins(0, 0, 0, 0)
+        devices_layout.setContentsMargins(8, 8, 8, 8)
+        devices_layout.setSpacing(10)
 
         devices_bar = QtWidgets.QHBoxLayout()
         devices_bar.setSpacing(12)
-        self.scan_btn = QtWidgets.QPushButton("Scan")
-        self.scan_btn.setFixedHeight(30)
+        self.scan_btn = QtWidgets.QPushButton("Refresh")
         self.scan_btn.clicked.connect(self.start_scan)
         self.status = QtWidgets.QLabel("Idle")
+        self.devices_refresh_box = QtWidgets.QComboBox()
+        self.devices_refresh_box.addItems(["Off", "10s", "15s", "20s", "30s", "60s", "2m", "5m", "10m", "30m", "1h"])
+        self.devices_refresh_box.setCurrentText("Off")
+        self.devices_refresh_box.currentIndexChanged.connect(self.on_devices_refresh_changed)
         devices_bar.addWidget(self.scan_btn)
         devices_bar.addWidget(self.status)
+        devices_bar.addWidget(QtWidgets.QLabel("Auto-Refresh:"))
+        devices_bar.addWidget(self.devices_refresh_box)
         devices_bar.addStretch(1)
         devices_layout.addLayout(devices_bar)
         devices_layout.addWidget(self.view)
-        self.tabs.addTab(devices_tab, "Local Devices")
-        self.tabs.addTab(tasmota_tab, "Tasmota Switches")
+        self._tab_index_devices = self.tabs.addTab(devices_tab, "Local Devices")
+        self._tab_index_tasmota = self.tabs.addTab(tasmota_tab, "Tasmota Switches")
 
         base_font = QtGui.QFont()
         base_font.setPointSize(13)
@@ -967,6 +983,8 @@ class NetViewQt(QtWidgets.QMainWindow):
         self.tasmota_model.itemChanged.connect(self.on_tasmota_item_changed)
         self.tasmota_timer = QtCore.QTimer(self)
         self.tasmota_timer.timeout.connect(self.on_tasmota_timer)
+        self.devices_timer = QtCore.QTimer(self)
+        self.devices_timer.timeout.connect(self.on_devices_timer)
 
         # Allow quitting with Ctrl+C even when the app has focus.
         QtWidgets.QApplication.instance().installEventFilter(self)
@@ -974,6 +992,8 @@ class NetViewQt(QtWidgets.QMainWindow):
         self.tabs.currentChanged.connect(self.on_tab_changed)
         self._status_initialized = False
         QtCore.QTimer.singleShot(100, self.start_status_checks)
+        QtCore.QTimer.singleShot(120, self.start_scan)
+        QtCore.QTimer.singleShot(140, self.start_tasmota_scan)
         QtCore.QTimer.singleShot(200, self.raise_)
         QtCore.QTimer.singleShot(250, self.activateWindow)
 
@@ -1006,6 +1026,7 @@ class NetViewQt(QtWidgets.QMainWindow):
             self._rows[ip] = row
             self._scan_count += 1
             self.status.setText(f"Scanning... ({self._scan_count} devices)")
+            self.update_tab_counts()
 
         for col, val in enumerate(values):
             item = self.model.item(row, col)
@@ -1078,16 +1099,19 @@ class NetViewQt(QtWidgets.QMainWindow):
     def scan_finished(self, count):
         self.scan_btn.setEnabled(True)
         self.status.setText(f"Done ({count} devices)")
+        self.update_tab_counts()
 
     def on_tab_changed(self, index):
-        tab = self.tabs.tabText(index)
-        if tab == "Network Status":
+        if index != self._tab_index_devices:
+            self.devices_timer.stop()
+        if index == self._tab_index_status:
             self.start_status_checks()
             self.apply_auto_refresh()
-        elif tab == "Local Devices":
+        elif index == self._tab_index_devices:
             self.status_timer.stop()
             self.start_scan()
-        elif tab == "Tasmota Switches":
+            self.apply_devices_auto_refresh()
+        elif index == self._tab_index_tasmota:
             self.status_timer.stop()
             if not self._tasmota_rows:
                 self.start_tasmota_scan()
@@ -1133,6 +1157,7 @@ class NetViewQt(QtWidgets.QMainWindow):
                 self._status_row_tooltip[row] = tips.get(key, "")
         thread = threading.Thread(target=self.run_status_checks, daemon=True)
         thread.start()
+        self.update_tab_counts()
 
     def add_status_row_pending(self, test, ip="", details="", tooltip=""):
         row = self.status_model.rowCount()
@@ -1182,6 +1207,7 @@ class NetViewQt(QtWidgets.QMainWindow):
         self._tasmota_scanning = True
         self.tasmota_model.removeRows(0, self.tasmota_model.rowCount())
         self._tasmota_rows = {}
+        self.update_tab_counts()
         thread = threading.Thread(target=self.tasmota_scan_worker, daemon=True)
         thread.start()
 
@@ -1195,7 +1221,7 @@ class NetViewQt(QtWidgets.QMainWindow):
             self._tasmota_scanning = False
             return
         base = ".".join(parts[:3])
-        ips = [f"{base}.{i}" for i in range(0, 255)]
+        ips = [f"{base}.{i}" for i in range(1, 255)]
 
         def probe(ip):
             if not tcp_port_open(ip, 80, timeout=0.2):
@@ -1252,6 +1278,7 @@ class NetViewQt(QtWidgets.QMainWindow):
             row = self.tasmota_model.rowCount()
             self.tasmota_model.insertRow(row)
             self._tasmota_rows[ip] = row
+            self.update_tab_counts()
 
         def set_item(col, text, align=None, color=None, check=None):
             item = self.tasmota_model.item(row, col)
@@ -1294,10 +1321,10 @@ class NetViewQt(QtWidgets.QMainWindow):
         today_text = f"{today} kWh" if today else ""
         yesterday_text = f"{yesterday} kWh" if yesterday else ""
         total_text = f"{total} kWh" if total else ""
-        set_item(5, power_text)
-        set_item(6, today_text)
-        set_item(7, yesterday_text)
-        set_item(8, total_text)
+        set_item(5, power_text, align=QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        set_item(6, today_text, align=QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        set_item(7, yesterday_text, align=QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        set_item(8, total_text, align=QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         set_item(9, wifi)
         set_item(10, model)
         self.tasmota_view.resizeColumnsToContents()
@@ -1340,12 +1367,37 @@ class NetViewQt(QtWidgets.QMainWindow):
             QtGui.QDesktopServices.openUrl(QtCore.QUrl(url))
 
     def on_tasmota_refresh_changed(self, _index):
-        if self.tabs.tabText(self.tabs.currentIndex()) == "Tasmota Switches":
+        if self.tabs.currentIndex() == self._tab_index_tasmota:
             self.apply_tasmota_auto_refresh()
 
     def on_tasmota_timer(self):
-        if self.tabs.tabText(self.tabs.currentIndex()) == "Tasmota Switches":
+        if self.tabs.currentIndex() == self._tab_index_tasmota:
             self.refresh_tasmota()
+
+    def on_devices_timer(self):
+        if self.tabs.currentIndex() == self._tab_index_devices:
+            self.start_scan()
+
+    def on_devices_refresh_changed(self, _index):
+        if self.tabs.currentIndex() == self._tab_index_devices:
+            self.apply_devices_auto_refresh()
+
+    def apply_devices_auto_refresh(self):
+        text = self.devices_refresh_box.currentText()
+        if text == "Off":
+            self.devices_timer.stop()
+            return
+        multipliers = {"s": 1, "m": 60, "h": 3600}
+        try:
+            if text[-1] in multipliers:
+                interval = int(text[:-1]) * multipliers[text[-1]]
+            else:
+                interval = int(text)
+        except Exception:
+            self.devices_timer.stop()
+            return
+        self.devices_timer.start(interval * 1000)
+        self.start_scan()
 
     def apply_tasmota_auto_refresh(self):
         text = self.tasmota_refresh_box.currentText()
@@ -1363,6 +1415,12 @@ class NetViewQt(QtWidgets.QMainWindow):
             return
         self.tasmota_timer.start(interval * 1000)
         self.refresh_tasmota()
+
+    def update_tab_counts(self):
+        if self._tab_index_devices is not None:
+            self.tabs.setTabText(self._tab_index_devices, f"Local Devices ({len(self._rows)})")
+        if self._tab_index_tasmota is not None:
+            self.tabs.setTabText(self._tab_index_tasmota, f"Tasmota Switches ({len(self._tasmota_rows)})")
 
     def update_web_column(self, row):
         name = self.model.item(row, 2)
@@ -1616,21 +1674,22 @@ class NetViewQt(QtWidgets.QMainWindow):
         self.status_timeout_enable.emit(True)
         self.status_retries_enable.emit(True)
         self._status_running = False
+        self.update_tab_counts()
 
     def on_timeout_changed(self, _index):
-        if self.tabs.tabText(self.tabs.currentIndex()) == "Network Status":
+        if self.tabs.currentIndex() == self._tab_index_status:
             self.start_status_checks()
 
     def on_retries_changed(self, _index):
-        if self.tabs.tabText(self.tabs.currentIndex()) == "Network Status":
+        if self.tabs.currentIndex() == self._tab_index_status:
             self.start_status_checks()
 
     def on_refresh_changed(self, _index):
-        if self.tabs.tabText(self.tabs.currentIndex()) == "Network Status":
+        if self.tabs.currentIndex() == self._tab_index_status:
             self.apply_auto_refresh()
 
     def on_status_timer(self):
-        if self.tabs.tabText(self.tabs.currentIndex()) == "Network Status":
+        if self.tabs.currentIndex() == self._tab_index_status:
             self.start_status_checks()
 
     def apply_auto_refresh(self):
