@@ -3,12 +3,15 @@
 import argparse
 import concurrent.futures
 import ipaddress
+import json
 import platform
 import queue
 import re
 import socket
 import subprocess
 import threading
+import urllib.request
+import urllib.error
 from pathlib import Path
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -264,6 +267,14 @@ def tcp_connect(host, port, timeout=1.5):
         return False
 
 
+def tcp_port_open(ip, port, timeout=0.2):
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def http_204_check(timeout=2.0):
     try:
         import urllib.request
@@ -286,6 +297,80 @@ def http_apple_captive_check(timeout=2.0):
             return resp.status == 200, f"HTTP {resp.status}", ip
     except Exception:
         return False, "HTTP error", ""
+
+
+def http_get_json(url, timeout=2.0):
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "netview/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read()
+        return json.loads(data.decode("utf-8", errors="ignore"))
+    except Exception:
+        return None
+
+
+def tasmota_fetch_status(ip, timeout=2.0):
+    data = http_get_json(f"http://{ip}/cm?cmnd=Status%200", timeout=timeout)
+    if VERBOSE >= 1:
+        vprint(f"[tasmota] {ip} -> {json.dumps(data, ensure_ascii=True)}")
+    if not isinstance(data, dict):
+        return None
+    if "Status" not in data and "StatusSTS" not in data:
+        return None
+    name = ""
+    if "Status" in data and isinstance(data["Status"], dict):
+        name = data["Status"].get("DeviceName", "")
+    model = ""
+    fwr = data.get("StatusFWR", {}) if isinstance(data.get("StatusFWR", {}), dict) else {}
+    hw = fwr.get("Hardware", "")
+    ver = fwr.get("Version", "")
+    if hw and ver:
+        model = f"{hw} {ver}"
+    elif hw:
+        model = hw
+    elif ver:
+        model = ver
+    wifi = ""
+    sts = data.get("StatusSTS", {}) if isinstance(data.get("StatusSTS", {}), dict) else {}
+    wifi_info = sts.get("Wifi", {}) if isinstance(sts.get("Wifi", {}), dict) else {}
+    ssid = wifi_info.get("SSId", "") or wifi_info.get("SSID", "")
+    ch = wifi_info.get("Channel", "")
+    rssi = wifi_info.get("RSSI", "")
+    signal = wifi_info.get("Signal", "")
+    if ssid:
+        sig = signal if signal != "" else (f"-{rssi}" if rssi != "" else "")
+        wifi = f"{ssid}/ch{ch}/{sig}" if ch != "" else f"{ssid}/{sig}"
+    sts = data.get("StatusSTS", {}) if isinstance(data.get("StatusSTS", {}), dict) else {}
+    power_state = sts.get("POWER", sts.get("POWER1", ""))
+    power_state = str(power_state).upper() if power_state is not None else ""
+    power_w = ""
+    sns = data.get("StatusSNS", {}) if isinstance(data.get("StatusSNS", {}), dict) else {}
+    energy = sns.get("ENERGY", {}) if isinstance(sns.get("ENERGY", {}), dict) else {}
+    if "Power" in energy:
+        power_w = str(energy.get("Power"))
+    today = str(energy.get("Today", "")) if "Today" in energy else ""
+    yesterday = str(energy.get("Yesterday", "")) if "Yesterday" in energy else ""
+    total = str(energy.get("Total", "")) if "Total" in energy else ""
+    return {
+        "name": name,
+        "model": model,
+        "wifi": wifi,
+        "power_state": power_state,
+        "power_w": power_w,
+        "today": today,
+        "yesterday": yesterday,
+        "total": total,
+    }
+
+
+def tasmota_set_power(ip, on, timeout=2.0):
+    cmd = "ON" if on else "OFF"
+    data = http_get_json(f"http://{ip}/cm?cmnd=Power%20{cmd}", timeout=timeout)
+    if not isinstance(data, dict):
+        return None
+    # response contains {"POWER":"ON"} or {"POWER1":"ON"}
+    val = data.get("POWER", data.get("POWER1", ""))
+    return str(val).upper() if val is not None else ""
 
 
 def status_tooltips():
@@ -679,6 +764,7 @@ class NetViewQt(QtWidgets.QMainWindow):
     status_timeout_enable = QtCore.Signal(bool)
     status_retries_enable = QtCore.Signal(bool)
     status_refresh_enable = QtCore.Signal(bool)
+    tasmota_row_update = QtCore.Signal(str, object)
 
     def __init__(self):
         super().__init__()
@@ -786,6 +872,48 @@ class NetViewQt(QtWidgets.QMainWindow):
         status_layout.addWidget(self.status_view)
         self.tabs.addTab(status_tab, "Network Status")
 
+        tasmota_tab = QtWidgets.QWidget()
+        tasmota_layout = QtWidgets.QVBoxLayout(tasmota_tab)
+        tasmota_layout.setContentsMargins(8, 8, 8, 8)
+        tasmota_layout.setSpacing(10)
+
+        tasmota_bar = QtWidgets.QHBoxLayout()
+        self.tasmota_rescan = QtWidgets.QPushButton("Rescan")
+        self.tasmota_rescan.clicked.connect(self.start_tasmota_scan)
+        self.tasmota_refresh = QtWidgets.QPushButton("Refresh")
+        self.tasmota_refresh.clicked.connect(self.refresh_tasmota)
+        self.tasmota_refresh_box = QtWidgets.QComboBox()
+        self.tasmota_refresh_box.addItems(["Off", "2s", "5s", "10s", "15s", "20s", "30s", "60s", "2m", "5m", "10m", "30m", "1h"])
+        self.tasmota_refresh_box.setCurrentText("Off")
+        self.tasmota_refresh_box.currentIndexChanged.connect(self.on_tasmota_refresh_changed)
+        tasmota_bar.addWidget(self.tasmota_rescan)
+        tasmota_bar.addWidget(self.tasmota_refresh)
+        tasmota_bar.addWidget(QtWidgets.QLabel("Auto-Refresh:"))
+        tasmota_bar.addWidget(self.tasmota_refresh_box)
+        tasmota_bar.addStretch(1)
+        tasmota_layout.addLayout(tasmota_bar)
+
+        self.tasmota_model = QtGui.QStandardItemModel(0, 11, self)
+        self.tasmota_model.setHorizontalHeaderLabels(
+            ["Name", "State", "Switch", "Web", "IP", "Power", "Today", "Yesterday", "Total", "WiFi", "Details"]
+        )
+        self.tasmota_view = QtWidgets.QTableView()
+        self.tasmota_view.setModel(self.tasmota_model)
+        t_header = self.tasmota_view.horizontalHeader()
+        t_header.setStretchLastSection(False)
+        for col in range(0, 10):
+            t_header.setSectionResizeMode(col, QtWidgets.QHeaderView.ResizeToContents)
+        t_header.setSectionResizeMode(10, QtWidgets.QHeaderView.Stretch)
+        self.tasmota_view.verticalHeader().setVisible(False)
+        self.tasmota_view.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.tasmota_view.setEditTriggers(QtWidgets.QAbstractItemView.AllEditTriggers)
+        self.tasmota_view.setShowGrid(False)
+        self.tasmota_view.setAlternatingRowColors(True)
+        self.tasmota_view.setWordWrap(False)
+        self.tasmota_view.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.tasmota_view.customContextMenuRequested.connect(self.show_table_context_menu)
+        self.tasmota_view.clicked.connect(self.on_tasmota_clicked)
+        tasmota_layout.addWidget(self.tasmota_view)
         devices_tab = QtWidgets.QWidget()
         devices_layout = QtWidgets.QVBoxLayout(devices_tab)
         devices_layout.setContentsMargins(0, 0, 0, 0)
@@ -802,6 +930,7 @@ class NetViewQt(QtWidgets.QMainWindow):
         devices_layout.addLayout(devices_bar)
         devices_layout.addWidget(self.view)
         self.tabs.addTab(devices_tab, "Local Devices")
+        self.tabs.addTab(tasmota_tab, "Tasmota Switches")
 
         base_font = QtGui.QFont()
         base_font.setPointSize(13)
@@ -809,9 +938,11 @@ class NetViewQt(QtWidgets.QMainWindow):
         self.status.setFont(base_font)
         self.view.setFont(base_font)
         self.status_view.setFont(base_font)
+        self.tasmota_view.setFont(base_font)
         self.mono_font = QtGui.QFont("Menlo", 12)
         self.view.verticalHeader().setDefaultSectionSize(28)
         self.ensure_device_column_widths()
+        self.tasmota_view.verticalHeader().setDefaultSectionSize(28)
 
         self.worker = ScanWorker()
         self.worker.upsert.connect(self.upsert_row)
@@ -829,6 +960,13 @@ class NetViewQt(QtWidgets.QMainWindow):
         self.status_timer = QtCore.QTimer(self)
         self.status_timer.timeout.connect(self.on_status_timer)
         self._status_running = False
+        self._tasmota_rows = {}
+        self._tasmota_scanning = False
+        self._tasmota_updating = False
+        self.tasmota_row_update.connect(self.update_tasmota_row)
+        self.tasmota_model.itemChanged.connect(self.on_tasmota_item_changed)
+        self.tasmota_timer = QtCore.QTimer(self)
+        self.tasmota_timer.timeout.connect(self.on_tasmota_timer)
 
         # Allow quitting with Ctrl+C even when the app has focus.
         QtWidgets.QApplication.instance().installEventFilter(self)
@@ -949,6 +1087,11 @@ class NetViewQt(QtWidgets.QMainWindow):
         elif tab == "Local Devices":
             self.status_timer.stop()
             self.start_scan()
+        elif tab == "Tasmota Switches":
+            self.status_timer.stop()
+            if not self._tasmota_rows:
+                self.start_tasmota_scan()
+            self.apply_tasmota_auto_refresh()
 
     def start_status_checks(self):
         vprint("[netview] status: start")
@@ -1033,6 +1176,194 @@ class NetViewQt(QtWidgets.QMainWindow):
         self.view.setColumnWidth(4, vendor_w)
         self.view.setColumnWidth(1, 40)
 
+    def start_tasmota_scan(self):
+        if self._tasmota_scanning:
+            return
+        self._tasmota_scanning = True
+        self.tasmota_model.removeRows(0, self.tasmota_model.rowCount())
+        self._tasmota_rows = {}
+        thread = threading.Thread(target=self.tasmota_scan_worker, daemon=True)
+        thread.start()
+
+    def tasmota_scan_worker(self):
+        local_ip = get_local_ip()
+        if not local_ip:
+            self._tasmota_scanning = False
+            return
+        parts = local_ip.split(".")
+        if len(parts) != 4:
+            self._tasmota_scanning = False
+            return
+        base = ".".join(parts[:3])
+        ips = [f"{base}.{i}" for i in range(0, 255)]
+
+        def probe(ip):
+            if not tcp_port_open(ip, 80, timeout=0.2):
+                return None
+            status = tasmota_fetch_status(ip, timeout=1.5)
+            if not status:
+                return None
+            return ip, status
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=128) as exe:
+            future_map = {exe.submit(probe, ip): ip for ip in ips}
+            for fut in concurrent.futures.as_completed(future_map):
+                res = safe_result(fut)
+                if not res:
+                    continue
+                ip, status = res
+                self.tasmota_row_update.emit(ip, status)
+
+        self._tasmota_scanning = False
+
+    def refresh_tasmota(self):
+        if not self._tasmota_rows:
+            return
+        thread = threading.Thread(target=self.tasmota_refresh_worker, daemon=True)
+        thread.start()
+
+    def tasmota_refresh_worker(self):
+        ips = list(self._tasmota_rows.keys())
+        def probe(ip):
+            status = tasmota_fetch_status(ip, timeout=1.5)
+            if not status:
+                return None
+            return ip, status
+        with concurrent.futures.ThreadPoolExecutor(max_workers=64) as exe:
+            future_map = {exe.submit(probe, ip): ip for ip in ips}
+            for fut in concurrent.futures.as_completed(future_map):
+                res = safe_result(fut)
+                if not res:
+                    continue
+                ip, status = res
+                self.tasmota_row_update.emit(ip, status)
+
+    def update_tasmota_row(self, ip, status):
+        row = self._tasmota_rows.get(ip)
+        name = status.get("name") or ip
+        power_state = status.get("power_state", "")
+        power_w = status.get("power_w", "")
+        today = status.get("today", "")
+        yesterday = status.get("yesterday", "")
+        total = status.get("total", "")
+        model = status.get("model", "")
+        wifi = status.get("wifi", "")
+        if row is None:
+            row = self.tasmota_model.rowCount()
+            self.tasmota_model.insertRow(row)
+            self._tasmota_rows[ip] = row
+
+        def set_item(col, text, align=None, color=None, check=None):
+            item = self.tasmota_model.item(row, col)
+            if item is None:
+                item = QtGui.QStandardItem(str(text))
+                self.tasmota_model.setItem(row, col, item)
+            else:
+                item.setText(str(text))
+            if align:
+                item.setTextAlignment(align)
+            if color:
+                item.setForeground(QtGui.QBrush(QtGui.QColor(color)))
+            if check is not None:
+                item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsEnabled)
+                item.setCheckState(QtCore.Qt.Checked if check else QtCore.Qt.Unchecked)
+            return item
+
+        set_item(0, name)
+        if power_state == "ON":
+            set_item(1, "On", align=QtCore.Qt.AlignCenter, color="#1E8E3E")
+        elif power_state == "OFF":
+            set_item(1, "Off", align=QtCore.Qt.AlignCenter, color="#6E6E73")
+        else:
+            set_item(1, "", align=QtCore.Qt.AlignCenter)
+        switch_item = self.tasmota_model.item(row, 2)
+        if switch_item is None:
+            switch_item = QtGui.QStandardItem("")
+            self.tasmota_model.setItem(row, 2, switch_item)
+        switch_item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsUserCheckable)
+        switch_item.setCheckState(QtCore.Qt.Checked if power_state == "ON" else QtCore.Qt.Unchecked)
+        web_item = self.tasmota_model.item(row, 3)
+        if web_item is None:
+            web_item = QtGui.QStandardItem("")
+            self.tasmota_model.setItem(row, 3, web_item)
+        web_item.setText("🌐")
+        web_item.setData(f"http://{ip}", QtCore.Qt.UserRole)
+        web_item.setTextAlignment(QtCore.Qt.AlignCenter)
+        set_item(4, ip)
+        power_text = f"{power_w} W" if power_w else ""
+        today_text = f"{today} kWh" if today else ""
+        yesterday_text = f"{yesterday} kWh" if yesterday else ""
+        total_text = f"{total} kWh" if total else ""
+        set_item(5, power_text)
+        set_item(6, today_text)
+        set_item(7, yesterday_text)
+        set_item(8, total_text)
+        set_item(9, wifi)
+        set_item(10, model)
+        self.tasmota_view.resizeColumnsToContents()
+        self.tasmota_view.setColumnWidth(3, 30)
+        # Keep sorted by Name
+        self.tasmota_view.sortByColumn(0, QtCore.Qt.AscendingOrder)
+
+    def on_tasmota_item_changed(self, item):
+        if self._tasmota_updating:
+            return
+        if item.column() != 2:
+            return
+        ip_item = self.tasmota_model.item(item.row(), 4)
+        if not ip_item:
+            return
+        ip = ip_item.text()
+        desired = item.checkState() == QtCore.Qt.Checked
+
+        def worker():
+            result = tasmota_set_power(ip, desired, timeout=2.0)
+            status = tasmota_fetch_status(ip, timeout=2.0)
+            if status:
+                self.tasmota_row_update.emit(ip, status)
+            elif result:
+                self.tasmota_row_update.emit(ip, {"name": "", "model": "", "wifi": "", "power_state": result, "power_w": "", "today": "", "yesterday": "", "total": ""})
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_tasmota_clicked(self, index):
+        if not index.isValid():
+            return
+        model = self.tasmota_view.model()
+        source_index = index
+        source_model = model
+        if source_index.column() != 3:
+            return
+        item = source_model.item(source_index.row(), source_index.column())
+        url = item.data(QtCore.Qt.UserRole) if item else ""
+        if url:
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl(url))
+
+    def on_tasmota_refresh_changed(self, _index):
+        if self.tabs.tabText(self.tabs.currentIndex()) == "Tasmota Switches":
+            self.apply_tasmota_auto_refresh()
+
+    def on_tasmota_timer(self):
+        if self.tabs.tabText(self.tabs.currentIndex()) == "Tasmota Switches":
+            self.refresh_tasmota()
+
+    def apply_tasmota_auto_refresh(self):
+        text = self.tasmota_refresh_box.currentText()
+        if text == "Off":
+            self.tasmota_timer.stop()
+            return
+        multipliers = {"s": 1, "m": 60, "h": 3600}
+        try:
+            if text[-1] in multipliers:
+                interval = int(text[:-1]) * multipliers[text[-1]]
+            else:
+                interval = int(text)
+        except Exception:
+            self.tasmota_timer.stop()
+            return
+        self.tasmota_timer.start(interval * 1000)
+        self.refresh_tasmota()
+
     def update_web_column(self, row):
         name = self.model.item(row, 2)
         ip_item = self.model.item(row, 0)
@@ -1092,11 +1423,18 @@ class NetViewQt(QtWidgets.QMainWindow):
         row = source_index.row()
         col = source_index.column()
         cell_text = source_model.data(source_index, QtCore.Qt.DisplayRole)
+        header_labels = [source_model.headerData(c, QtCore.Qt.Horizontal) for c in range(source_model.columnCount())]
+        web_col = None
+        for i, label in enumerate(header_labels):
+            if str(label) == "Web":
+                web_col = i
+                break
+
         row_values = []
         for c in range(source_model.columnCount()):
             idx = source_model.index(row, c)
             val = source_model.data(idx, QtCore.Qt.DisplayRole)
-            if c == 1:
+            if web_col is not None and c == web_col:
                 url = source_model.data(idx, QtCore.Qt.UserRole)
                 val = url or ""
             row_values.append(val)
@@ -1112,7 +1450,7 @@ class NetViewQt(QtWidgets.QMainWindow):
         copy_row = menu.addAction("Copy Row")
         action = menu.exec(view.viewport().mapToGlobal(pos))
         if action == copy_cell:
-            if source_index.column() == 1:
+            if web_col is not None and source_index.column() == web_col:
                 url = source_model.data(source_index, QtCore.Qt.UserRole)
                 QtWidgets.QApplication.clipboard().setText(url or "")
             else:
