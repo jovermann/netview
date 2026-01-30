@@ -1,0 +1,1357 @@
+#!/usr/bin/env python3.13
+
+import argparse
+import concurrent.futures
+import ipaddress
+import platform
+import queue
+import re
+import socket
+import subprocess
+import threading
+from pathlib import Path
+
+from PySide6 import QtCore, QtGui, QtWidgets
+import signal
+
+VERBOSE = 0
+
+
+def vprint(msg, level=1):
+    if VERBOSE >= level:
+        print(msg, flush=True)
+
+
+def get_local_ip(timeout=1.0):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+def iter_subnet_hosts(ip_str, prefix=24):
+    try:
+        net = ipaddress.ip_network(f"{ip_str}/{prefix}", strict=False)
+    except ValueError:
+        return []
+    return [str(h) for h in net.hosts()]
+
+
+def should_include_ip(ip, net=None):
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if addr.is_multicast:
+        return False
+    if net is not None:
+        try:
+            if ipaddress.ip_address(ip) == net.broadcast_address:
+                return False
+        except Exception:
+            pass
+    return True
+
+
+def ping_host(ip, timeout_ms=10):
+    system = platform.system().lower()
+    if system == "windows":
+        cmd = ["ping", "-n", "1", "-w", str(timeout_ms), ip]
+    elif system == "darwin":
+        cmd = ["ping", "-n", "-c", "1", "-W", str(timeout_ms), ip]
+    else:
+        cmd = ["ping", "-n", "-c", "1", "-W", "1", ip]
+    return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
+def ping_host_timed(host, timeout_ms=1000):
+    system = platform.system().lower()
+    if system == "windows":
+        cmd = ["ping", "-n", "1", "-w", str(timeout_ms), host]
+    elif system == "darwin":
+        cmd = ["ping", "-n", "-c", "1", "-W", str(timeout_ms), host]
+    else:
+        cmd = ["ping", "-n", "-c", "1", "-W", "1", host]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+        out = proc.stdout + proc.stderr
+    except Exception:
+        return False, "", ""
+
+    if proc.returncode != 0:
+        return False, "", ""
+    ip = ""
+    for line in out.splitlines():
+        if line.startswith("PING ") and "(" in line and ")" in line:
+            try:
+                ip = line.split("(", 1)[1].split(")", 1)[0].strip()
+            except Exception:
+                ip = ""
+    for line in out.splitlines():
+        m = re.search(r"time[=<]\s*([0-9.,]+)\s*ms", line)
+        if m:
+            val = m.group(1).replace(",", ".")
+            return True, f"{val} ms", ip
+    for line in out.splitlines():
+        if "round-trip" in line or "rtt min/avg/max" in line:
+            m = re.search(r"=\s*([0-9.,]+)/([0-9.,]+)/", line)
+            if m:
+                avg = m.group(2).replace(",", ".")
+                return True, f"{avg} ms", ip
+    return True, "n/a", ip
+
+
+def ping_with_retries(host, timeout_ms=100, attempts=10):
+    failed = 0
+    last_ip = ""
+    for _ in range(attempts):
+        ok, ms, ip = ping_host_timed(host, timeout_ms=timeout_ms)
+        last_ip = ip or last_ip
+        if ok:
+            return True, ms, last_ip, failed
+        failed += 1
+    return False, "", last_ip, failed
+
+
+def parse_arp_table():
+    entries = {}
+    system = platform.system().lower()
+    if system == "windows":
+        cmd = ["arp", "-a"]
+    else:
+        cmd = ["arp", "-na"]
+
+    try:
+        out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+    except Exception:
+        return entries
+
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if "incomplete" in line.lower():
+            continue
+
+        if system == "windows":
+            parts = line.split()
+            if len(parts) >= 2 and "." in parts[0]:
+                ip = parts[0]
+                mac = format_mac(parts[1])
+                if mac:
+                    entries[ip] = {"name": "", "mac": mac}
+        else:
+            if "(" in line and ")" in line and " at " in line:
+                try:
+                    name_part, rest = line.split("(", 1)
+                    ip = rest.split(")", 1)[0]
+                    name = name_part.strip().strip("?").strip()
+                    mac = ""
+                    if " at " in line:
+                        mac = line.split(" at ", 1)[1].split()[0]
+                    mac = format_mac(mac)
+                    if mac:
+                        entries[ip] = {"name": name, "mac": mac}
+                except Exception:
+                    continue
+
+    return entries
+
+
+def get_default_gateway():
+    system = platform.system().lower()
+    try:
+        if system == "darwin":
+            out = subprocess.run(["route", "-n", "get", "default"], capture_output=True, text=True, timeout=2).stdout
+            for line in out.splitlines():
+                if line.strip().startswith("gateway:"):
+                    return line.split(":", 1)[1].strip()
+        elif system == "linux":
+            out = subprocess.run(["ip", "route", "show", "default"], capture_output=True, text=True, timeout=2).stdout
+            parts = out.split()
+            if "via" in parts:
+                return parts[parts.index("via") + 1]
+        elif system == "windows":
+            out = subprocess.run(["route", "print", "0.0.0.0"], capture_output=True, text=True, timeout=2).stdout
+            for line in out.splitlines():
+                if line.strip().startswith("0.0.0.0"):
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        return parts[2]
+    except Exception:
+        return ""
+    return ""
+
+
+def get_dns_servers():
+    system = platform.system().lower()
+    servers = []
+    try:
+        if system == "darwin":
+            out = subprocess.run(["scutil", "--dns"], capture_output=True, text=True, timeout=2).stdout
+            for line in out.splitlines():
+                line = line.strip()
+                if line.startswith("nameserver["):
+                    parts = line.split(":", 1)
+                    if len(parts) == 2:
+                        servers.append(parts[1].strip())
+        elif system == "linux":
+            with open("/etc/resolv.conf", "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if line.startswith("nameserver"):
+                        servers.append(line.split()[1])
+        elif system == "windows":
+            out = subprocess.run(["ipconfig", "/all"], capture_output=True, text=True, timeout=2).stdout
+            for line in out.splitlines():
+                if "DNS Servers" in line:
+                    parts = line.split(":")
+                    if len(parts) == 2:
+                        servers.append(parts[1].strip())
+    except Exception:
+        return []
+    # return up to two unique servers
+    uniq = []
+    for s in servers:
+        if s and s not in uniq:
+            uniq.append(s)
+        if len(uniq) >= 2:
+            break
+    return uniq
+
+
+def resolve_host(host, timeout=2.0):
+    try:
+        return socket.getaddrinfo(host, None)[0][4][0]
+    except Exception:
+        return ""
+
+
+def resolve_host_via_dns(host, dns_server, timeout=2.0):
+    system = platform.system().lower()
+    try:
+        if system in ("darwin", "linux"):
+            cmd = ["nslookup", host, dns_server]
+        else:
+            cmd = ["nslookup", host, dns_server]
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("Address:"):
+                return line.split(":", 1)[1].strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def reverse_lookup(ip, timeout=2.0):
+    try:
+        name, _, _ = socket.gethostbyaddr(ip)
+        return name
+    except Exception:
+        return ""
+
+
+def tcp_connect(host, port, timeout=1.5):
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def http_204_check(timeout=2.0):
+    try:
+        import urllib.request
+        host = "connectivitycheck.gstatic.com"
+        ip = resolve_host(host)
+        req = urllib.request.Request(f"http://{host}/generate_204")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status == 204, f"HTTP {resp.status}", ip
+    except Exception:
+        return False, "HTTP error", ""
+
+
+def http_apple_captive_check(timeout=2.0):
+    try:
+        import urllib.request
+        host = "captive.apple.com"
+        ip = resolve_host(host)
+        req = urllib.request.Request(f"http://{host}/hotspot-detect.html")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status == 200, f"HTTP {resp.status}", ip
+    except Exception:
+        return False, "HTTP error", ""
+
+
+def status_tooltips():
+    return {
+        "Interface status": "Checks whether the local interface is up and has an IP address.\nPass: link+IP present. Fail: interface down or no IP.",
+        "DHCP lease": "Checks DHCP lease info (if available).\nPass: DHCP lease found. Fail: no lease info (possible static IP or DHCP issue).",
+        "Local gateway": "Pings the default gateway to verify LAN reachability.\nPass: LAN and gateway reachable. Fail: local network or gateway issue.",
+        "Gateway ARP": "Verifies the gateway MAC is in ARP cache.\nPass: L2 reachability to gateway. Fail: ARP not learned.",
+        "Default route": "Checks if a default route exists.\nPass: routing configured. Fail: no default route (no internet path).",
+        "DNS system resolve": "Uses system resolver to resolve heise.de.\nPass: DNS resolution works. Fail: system DNS broken.",
+        "DNS server 1": "Resolves heise.de using DNS server 1 explicitly.\nPass: DNS server reachable/working. Fail: DNS server unreachable or failing.",
+        "DNS server 2": "Resolves heise.de using DNS server 2 explicitly.\nPass: DNS server reachable/working. Fail: DNS server unreachable or failing.",
+        "Reverse lookup 1.1.1.1": "Reverse-DNS lookup for 1.1.1.1.\nPass: reverse DNS reachable. Fail: DNS reverse lookup failing.",
+        "Reverse lookup 8.8.8.8": "Reverse-DNS lookup for 8.8.8.8.\nPass: reverse DNS reachable. Fail: DNS reverse lookup failing.",
+        "Ping 8.8.8.8": "ICMP ping to 8.8.8.8 (Google DNS).\nPass: internet path reachable. Fail: upstream connectivity issue.",
+        "Ping 1.1.1.1": "ICMP ping to 1.1.1.1 (Cloudflare DNS).\nPass: internet path reachable. Fail: upstream connectivity issue.",
+        "Ping heise.de": "ICMP ping to heise.de (domain).\nPass: DNS + internet reachable. Fail: DNS or connectivity problem.",
+        "TCP 443 heise.de": "TCP connect to heise.de:443.\nPass: HTTPS reachable. Fail: firewall or upstream block.",
+        "HTTP 204 check": "Fetches a known 204 endpoint (Google).\nPass: no captive portal. Fail: portal or HTTP blocked.",
+        "Apple captive check": "Fetches Apple's captive portal check URL.\nPass: no portal. Fail: portal or HTTP blocked.",
+        "Traceroute 8.8.8.8": "Traceroute to 8.8.8.8 (first 5 hops).\nPass: route visible. Fail: routing/ICMP blocked.",
+        "DNS hijack check": "Ensures heise.de resolves to a public IP.\nPass: normal DNS. Fail: private IP suggests hijack/portal.",
+    }
+
+
+def get_interface_info():
+    local_ip = get_local_ip()
+    if not local_ip:
+        return {"iface": "", "ip": "", "netmask": "", "up": False}
+    system = platform.system().lower()
+    if system == "darwin":
+        try:
+            out = subprocess.run(["ifconfig"], capture_output=True, text=True, timeout=2).stdout
+            iface = ""
+            netmask = ""
+            up = False
+            current = ""
+            for line in out.splitlines():
+                if line and not line.startswith("\t") and not line.startswith(" "):
+                    current = line.split(":", 1)[0]
+                if f"inet {local_ip}" in line:
+                    iface = current
+                    if "netmask" in line:
+                        netmask = line.split("netmask", 1)[1].split()[0].strip()
+                    if "status: active" in out:
+                        up = True
+            return {"iface": iface, "ip": local_ip, "netmask": netmask, "up": True}
+        except Exception:
+            return {"iface": "", "ip": local_ip, "netmask": "", "up": True}
+    if system == "linux":
+        try:
+            out = subprocess.run(["ip", "-o", "addr", "show"], capture_output=True, text=True, timeout=2).stdout
+            for line in out.splitlines():
+                if "inet " in line and local_ip in line:
+                    parts = line.split()
+                    iface = parts[1]
+                    cidr = parts[3]
+                    netmask = cidr.split("/", 1)[1] if "/" in cidr else ""
+                    return {"iface": iface, "ip": local_ip, "netmask": netmask, "up": True}
+        except Exception:
+            pass
+        return {"iface": "", "ip": local_ip, "netmask": "", "up": True}
+    # Windows: best-effort
+    return {"iface": "", "ip": local_ip, "netmask": "", "up": True}
+
+
+def format_seconds(seconds):
+    if seconds < 0:
+        seconds = 0
+    d = seconds // 86400
+    h = (seconds % 86400) // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    parts = []
+    if d:
+        parts.append(f"{d}d")
+    if h:
+        parts.append(f"{h}h")
+    if m:
+        parts.append(f"{m}m")
+    if s or not parts:
+        parts.append(f"{s}s")
+    return " ".join(parts)
+
+
+def get_dhcp_lease_info(iface):
+    system = platform.system().lower()
+    if system == "darwin" and iface:
+        try:
+            out = subprocess.run(["ipconfig", "getpacket", iface], capture_output=True, text=True, timeout=2).stdout
+            for line in out.splitlines():
+                if "lease_time" in line:
+                    raw = line.strip()
+                    seconds = None
+                    hex_m = re.search(r"0x[0-9a-fA-F]+", raw)
+                    if hex_m:
+                        try:
+                            seconds = int(hex_m.group(0), 16)
+                        except Exception:
+                            seconds = None
+                    if seconds is None:
+                        dec_m = re.search(r"\\b([0-9]+)\\b", raw)
+                        if dec_m:
+                            try:
+                                seconds = int(dec_m.group(1))
+                            except Exception:
+                                seconds = None
+                    if seconds is not None:
+                        hhmmss = format_seconds(seconds)
+                        return f"{raw} ({hhmmss})"
+                    return raw
+                if "lease_expiration" in line:
+                    return line.strip()
+        except Exception:
+            return "Not available"
+    return "Not supported"
+
+
+def traceroute_host(host, timeout=3.0):
+    system = platform.system().lower()
+    try:
+        if system == "windows":
+            cmd = ["tracert", "-h", "5", "-w", "1000", host]
+        else:
+            cmd = ["traceroute", "-n", "-m", "5", "-w", "1", host]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        out = (proc.stdout or "") + (proc.stderr or "")
+        lines = [l for l in out.splitlines() if l.strip() and l.strip()[0].isdigit()]
+        hop_count = len(lines)
+        if proc.returncode != 0 or hop_count == 0:
+            return False, "no hops"
+        return True, f"{hop_count} hops"
+    except Exception:
+        return False, "timeout"
+
+
+def check_port(ip, port, timeout=0.4):
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def scan_ports(ip, ports, timeout=0.4):
+    open_ports = []
+    for port in ports:
+        if check_port(ip, port, timeout=timeout):
+            open_ports.append(port)
+    return open_ports
+
+
+def resolve_name(ip, timeout=0.6):
+    system = platform.system().lower()
+    try:
+        if system == "darwin":
+            cmd = ["/usr/bin/dscacheutil", "-q", "host", "-a", "ip_address", ip]
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+            for line in out.splitlines():
+                if line.strip().lower().startswith("name:"):
+                    return line.split(":", 1)[1].strip()
+            return ""
+        if system == "linux":
+            cmd = ["getent", "hosts", ip]
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+            parts = out.split()
+            return parts[1] if len(parts) >= 2 else ""
+        if system == "windows":
+            cmd = ["nslookup", ip]
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+            for line in out.splitlines():
+                if line.strip().lower().startswith("name:"):
+                    return line.split(":", 1)[1].strip()
+            return ""
+        name, _, _ = socket.gethostbyaddr(ip)
+        return name
+    except Exception:
+        return ""
+
+
+def format_mac(mac):
+    if not mac:
+        return ""
+    mac = mac.strip().lower()
+    if "incomplete" in mac:
+        return ""
+    mac = mac.replace("-", ":")
+    parts = mac.split(":")
+    if len(parts) == 1 and len(mac) == 12:
+        parts = [mac[i:i+2] for i in range(0, 12, 2)]
+    normalized = []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if len(part) == 1:
+            part = "0" + part
+        elif len(part) > 2:
+            part = part[-2:]
+        normalized.append(part)
+    if not normalized:
+        return ""
+    return ":".join(normalized).upper()
+
+
+def load_oui_db():
+    db = {}
+    candidates = [
+        Path(__file__).parent / "oui.txt",
+        Path(__file__).parent / "oui.csv",
+    ]
+    brew_root = Path("/opt/homebrew/Cellar/nmap")
+    if brew_root.exists():
+        for ver_dir in sorted(brew_root.iterdir(), reverse=True):
+            nmap_file = ver_dir / "share" / "nmap" / "nmap-mac-prefixes"
+            if nmap_file.exists():
+                candidates.append(nmap_file)
+                break
+
+    path = next((p for p in candidates if p.exists()), None)
+    if not path:
+        return db
+
+    try:
+        text = path.read_text(errors="ignore")
+    except Exception:
+        return db
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "," in line and "(base 16)" not in line:
+            parts = line.split(",", 1)
+            if len(parts) == 2:
+                oui = parts[0].strip().replace("-", ":").upper()
+                vendor = parts[1].strip()
+                if len(oui) >= 8 and vendor:
+                    db[oui[:8]] = vendor
+            continue
+        if "(base 16)" in line:
+            left, right = line.split("(base 16)", 1)
+            oui = left.strip().replace("-", ":").upper()
+            vendor = right.strip()
+            if len(oui) >= 8 and vendor:
+                db[oui[:8]] = vendor
+            continue
+        if "\t" in line or " " in line:
+            if "\t" in line:
+                left, right = line.split("\t", 1)
+            else:
+                left, right = line.split(" ", 1)
+            oui = left.strip()
+            vendor = right.strip()
+            if len(oui) >= 6 and vendor:
+                if len(oui) == 6:
+                    oui = ":".join([oui[i:i+2] for i in range(0, 6, 2)])
+                db[oui[:8].upper()] = vendor
+    return db
+
+
+def vendor_for_mac(mac, oui_db):
+    if not mac:
+        return ""
+    prefix = format_mac(mac)[:8]
+    vendor = oui_db.get(prefix, "")
+    if vendor:
+        return vendor
+    try:
+        first_byte = int(format_mac(mac)[:2], 16)
+        ig = "multicast" if (first_byte & 0x01) else "unicast"
+        ul = "local" if (first_byte & 0x02) else "global"
+        return f"({ig}, {ul})"
+    except Exception:
+        return ""
+
+
+def safe_result(fut, default=None):
+    try:
+        return fut.result()
+    except Exception:
+        return default
+
+
+class SortProxy(QtCore.QSortFilterProxyModel):
+    def lessThan(self, left, right):
+        col = left.column()
+        lval = left.data()
+        rval = right.data()
+
+        def ip_key(val):
+            try:
+                return tuple(int(x) for x in str(val).split("."))
+            except Exception:
+                return (999, 999, 999, 999)
+
+        def ports_key(val):
+            s = str(val)
+            if not s or s == "-":
+                return ()
+            try:
+                return tuple(int(x) for x in s.split(","))
+            except Exception:
+                return ()
+
+        if col == 0:
+            return ip_key(lval) < ip_key(rval)
+        if col == 5:
+            return ports_key(lval) < ports_key(rval)
+        return str(lval).lower() < str(rval).lower()
+
+
+class ScanWorker(QtCore.QObject):
+    upsert = QtCore.Signal(str, str, str, str)
+    merge_identity = QtCore.Signal(str, str, str)
+    update_ports = QtCore.Signal(str, list)
+    update_name = QtCore.Signal(str, str)
+    status = QtCore.Signal(str)
+    finished = QtCore.Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._work_q = None
+        self._queued = set()
+
+    def start(self):
+        t = threading.Thread(target=self.scan, daemon=True)
+        t.start()
+
+    def scan(self):
+        self.status.emit("Scanning...")
+        self._work_q = queue.Queue()
+        self._queued = set()
+        threading.Thread(target=self.background_worker, daemon=True).start()
+
+        local_ip = get_local_ip()
+        if not local_ip:
+            self.status.emit("No network")
+            self.finished.emit(0)
+            return
+
+        net = ipaddress.ip_network(f"{local_ip}/24", strict=False)
+        hosts = iter_subnet_hosts(local_ip, prefix=24)
+        targets = [ip for ip in hosts if ip != local_ip and should_include_ip(ip, net)]
+        found = set()
+
+        def enqueue_work(ip, want_name=True, want_ports=True):
+            if ip in self._queued:
+                return
+            self._queued.add(ip)
+            self._work_q.put((ip, want_name, want_ports))
+
+        arp = parse_arp_table()
+        for ip, entry in arp.items():
+            if ip == local_ip or not should_include_ip(ip, net):
+                continue
+            found.add(ip)
+            name = entry.get("name", "")
+            mac = entry.get("mac", "")
+            self.upsert.emit(ip, name, mac, "Pending")
+            enqueue_work(ip, want_name=not bool(name), want_ports=True)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=128) as pinger:
+            ping_futures = {pinger.submit(ping_host, ip, 10): ip for ip in targets}
+            for fut in concurrent.futures.as_completed(ping_futures):
+                ip = ping_futures[fut]
+                try:
+                    alive = fut.result()
+                except Exception:
+                    alive = False
+                if not alive:
+                    continue
+                if ip in found or not should_include_ip(ip, net):
+                    continue
+                found.add(ip)
+                self.upsert.emit(ip, "", "", "Pending")
+                enqueue_work(ip, want_name=True, want_ports=True)
+
+        arp = parse_arp_table()
+        for ip, entry in arp.items():
+            if ip in found or not should_include_ip(ip, net):
+                continue
+            found.add(ip)
+            name = entry.get("name", "")
+            mac = entry.get("mac", "")
+            self.upsert.emit(ip, name, mac, "Pending")
+            enqueue_work(ip, want_name=not bool(name), want_ports=True)
+
+        arp = parse_arp_table()
+        for ip, entry in arp.items():
+            if ip not in found or not should_include_ip(ip, net):
+                continue
+            name = entry.get("name", "")
+            mac = entry.get("mac", "")
+            if name or mac:
+                self.merge_identity.emit(ip, name, mac)
+
+        self._work_q.put(None)
+        self.finished.emit(len(found))
+
+    def background_worker(self):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as name_pool, \
+            concurrent.futures.ThreadPoolExecutor(max_workers=32) as port_pool:
+            while True:
+                item = self._work_q.get()
+                if item is None:
+                    break
+                ip, want_name, want_ports = item
+                if want_name:
+                    fut = name_pool.submit(resolve_name, ip)
+                    fut.add_done_callback(lambda f, ip=ip: self.update_name.emit(ip, safe_result(f, default="")))
+                if want_ports:
+                    fut = port_pool.submit(scan_ports, ip, [22, 80, 443])
+                    fut.add_done_callback(lambda f, ip=ip: self.update_ports.emit(ip, safe_result(f, default=[])))
+
+
+class NetViewQt(QtWidgets.QMainWindow):
+    status_row_update = QtCore.Signal(int, bool, str, str, str)
+    status_summary = QtCore.Signal(str)
+    status_retry_enable = QtCore.Signal(bool)
+    status_timeout_enable = QtCore.Signal(bool)
+    status_retries_enable = QtCore.Signal(bool)
+    status_refresh_enable = QtCore.Signal(bool)
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("netview")
+        self.resize(1300, 820)
+
+        self._oui_db = load_oui_db()
+        self._rows = {}
+        self._scan_count = 0
+
+        menu = self.menuBar().addMenu("Netview")
+        quit_action = QtGui.QAction("Quit", self)
+        quit_action.setShortcut(QtGui.QKeySequence.Quit)
+        quit_action.triggered.connect(QtWidgets.QApplication.quit)
+        menu.addAction(quit_action)
+
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+        layout = QtWidgets.QVBoxLayout(central)
+        layout.setContentsMargins(16, 16, 16, 12)
+        layout.setSpacing(10)
+
+        bar = QtWidgets.QHBoxLayout()
+        bar.setSpacing(12)
+        bar.addStretch(1)
+        layout.addLayout(bar)
+
+        self.tabs = QtWidgets.QTabWidget()
+        layout.addWidget(self.tabs)
+
+        self.model = QtGui.QStandardItemModel(0, 6, self)
+        self.model.setHorizontalHeaderLabels(
+            ["IP Address", "Web", "Name", "MAC", "MAC Vendor", "Ports"]
+        )
+
+        self.proxy = SortProxy(self)
+        self.proxy.setSourceModel(self.model)
+
+        self.view = QtWidgets.QTableView()
+        self.view.setModel(self.proxy)
+        self.view.setSortingEnabled(True)
+        self.view.horizontalHeader().setStretchLastSection(True)
+        self.view.horizontalHeader().setDefaultAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        self.view.verticalHeader().setVisible(False)
+        self.view.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.view.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.view.setShowGrid(False)
+        self.view.setAlternatingRowColors(True)
+        self.view.setWordWrap(False)
+        self.view.setCornerButtonEnabled(False)
+        self.view.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.view.customContextMenuRequested.connect(self.show_table_context_menu)
+        self.view.clicked.connect(self.on_device_clicked)
+
+        status_tab = QtWidgets.QWidget()
+        status_layout = QtWidgets.QVBoxLayout(status_tab)
+        status_layout.setContentsMargins(8, 8, 8, 8)
+        status_layout.setSpacing(10)
+
+        status_bar = QtWidgets.QHBoxLayout()
+        self.status_retry = QtWidgets.QPushButton("Refresh")
+        self.status_retry.clicked.connect(self.start_status_checks)
+        self.status_timeout = QtWidgets.QComboBox()
+        self.status_timeout.addItems(["5", "10", "20", "50", "100", "200", "500", "1000", "2000", "5000", "10000"])
+        self.status_timeout.setCurrentText("200")
+        self.status_timeout.currentIndexChanged.connect(self.on_timeout_changed)
+        self.status_retries = QtWidgets.QComboBox()
+        self.status_retries.addItems(["1", "2", "3", "5", "10"])
+        self.status_retries.setCurrentText("5")
+        self.status_retries.currentIndexChanged.connect(self.on_retries_changed)
+        self.status_refresh = QtWidgets.QComboBox()
+        self.status_refresh.addItems(["Off", "2s", "5s", "10s", "15s", "20s", "30s", "60s", "2m", "5m", "10m", "30m", "1h"])
+        self.status_refresh.setCurrentText("Off")
+        self.status_refresh.currentIndexChanged.connect(self.on_refresh_changed)
+        self.status_text = QtWidgets.QLabel("Idle")
+        status_bar.addWidget(self.status_retry)
+        status_bar.addWidget(QtWidgets.QLabel("Ping timeout (ms):"))
+        status_bar.addWidget(self.status_timeout)
+        status_bar.addWidget(QtWidgets.QLabel("Retries:"))
+        status_bar.addWidget(self.status_retries)
+        status_bar.addWidget(QtWidgets.QLabel("Auto-Refresh:"))
+        status_bar.addWidget(self.status_refresh)
+        status_bar.addWidget(self.status_text)
+        status_bar.addStretch(1)
+        status_layout.addLayout(status_bar)
+
+        self.status_model = QtGui.QStandardItemModel(0, 5, self)
+        self.status_model.setHorizontalHeaderLabels(["Status", "Test", "IP", "Ping", "Details"])
+
+        self.status_view = QtWidgets.QTableView()
+        self.status_view.setModel(self.status_model)
+        self.status_view.horizontalHeader().setStretchLastSection(True)
+        self.status_view.verticalHeader().setVisible(False)
+        self.status_view.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.status_view.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.status_view.setShowGrid(False)
+        self.status_view.setAlternatingRowColors(True)
+        self.status_view.setWordWrap(False)
+        status_header = self.status_view.horizontalHeader()
+        for col in range(4):
+            status_header.setSectionResizeMode(col, QtWidgets.QHeaderView.ResizeToContents)
+        status_header.setSectionResizeMode(4, QtWidgets.QHeaderView.Stretch)
+        self.status_view.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.status_view.customContextMenuRequested.connect(self.show_table_context_menu)
+        status_layout.addWidget(self.status_view)
+        self.tabs.addTab(status_tab, "Network Status")
+
+        devices_tab = QtWidgets.QWidget()
+        devices_layout = QtWidgets.QVBoxLayout(devices_tab)
+        devices_layout.setContentsMargins(0, 0, 0, 0)
+
+        devices_bar = QtWidgets.QHBoxLayout()
+        devices_bar.setSpacing(12)
+        self.scan_btn = QtWidgets.QPushButton("Scan")
+        self.scan_btn.setFixedHeight(30)
+        self.scan_btn.clicked.connect(self.start_scan)
+        self.status = QtWidgets.QLabel("Idle")
+        devices_bar.addWidget(self.scan_btn)
+        devices_bar.addWidget(self.status)
+        devices_bar.addStretch(1)
+        devices_layout.addLayout(devices_bar)
+        devices_layout.addWidget(self.view)
+        self.tabs.addTab(devices_tab, "Local Devices")
+
+        base_font = QtGui.QFont()
+        base_font.setPointSize(13)
+        self.setFont(base_font)
+        self.status.setFont(base_font)
+        self.view.setFont(base_font)
+        self.status_view.setFont(base_font)
+        self.mono_font = QtGui.QFont("Menlo", 12)
+        self.view.verticalHeader().setDefaultSectionSize(28)
+        self.ensure_device_column_widths()
+
+        self.worker = ScanWorker()
+        self.worker.upsert.connect(self.upsert_row)
+        self.worker.merge_identity.connect(self.merge_identity)
+        self.worker.update_ports.connect(self.update_ports)
+        self.worker.update_name.connect(self.apply_name)
+        self.worker.status.connect(self.status.setText)
+        self.worker.finished.connect(self.scan_finished)
+        self.status_row_update.connect(self.update_status_row)
+        self.status_summary.connect(self.status_text.setText)
+        self.status_retry_enable.connect(self.status_retry.setEnabled)
+        self.status_timeout_enable.connect(self.status_timeout.setEnabled)
+        self.status_retries_enable.connect(self.status_retries.setEnabled)
+        self.status_refresh_enable.connect(self.status_refresh.setEnabled)
+        self.status_timer = QtCore.QTimer(self)
+        self.status_timer.timeout.connect(self.on_status_timer)
+        self._status_running = False
+
+        # Allow quitting with Ctrl+C even when the app has focus.
+        QtWidgets.QApplication.instance().installEventFilter(self)
+
+        self.tabs.currentChanged.connect(self.on_tab_changed)
+        self._status_initialized = False
+        QtCore.QTimer.singleShot(100, self.start_status_checks)
+        QtCore.QTimer.singleShot(200, self.raise_)
+        QtCore.QTimer.singleShot(250, self.activateWindow)
+
+    def eventFilter(self, obj, event):
+        if event.type() == QtCore.QEvent.KeyPress:
+            if event.key() == QtCore.Qt.Key_C and (event.modifiers() & QtCore.Qt.ControlModifier):
+                QtWidgets.QApplication.quit()
+                return True
+        return super().eventFilter(obj, event)
+
+    def start_scan(self):
+        self.scan_btn.setEnabled(False)
+        self.status.setText("Scanning...")
+        self.clear_table()
+        self._scan_count = 0
+        self.worker.start()
+
+    def clear_table(self):
+        self.model.removeRows(0, self.model.rowCount())
+        self._rows = {}
+
+    def upsert_row(self, ip, name, mac, ports):
+        row = self._rows.get(ip)
+        fm = format_mac(mac)
+        vendor = vendor_for_mac(fm, self._oui_db)
+        values = [ip, "", name, fm, vendor, ports]
+        if row is None:
+            row = self.model.rowCount()
+            self.model.insertRow(row)
+            self._rows[ip] = row
+            self._scan_count += 1
+            self.status.setText(f"Scanning... ({self._scan_count} devices)")
+
+        for col, val in enumerate(values):
+            item = self.model.item(row, col)
+            if item is None:
+                item = QtGui.QStandardItem(str(val))
+                if col == 3:
+                    item.setFont(self.mono_font)
+                self.model.setItem(row, col, item)
+            else:
+                item.setText(str(val))
+        self.update_web_column(row)
+        self.view.sortByColumn(0, QtCore.Qt.AscendingOrder)
+        self.view.resizeColumnsToContents()
+        self.ensure_device_column_widths()
+        # Auto-size status table columns to contents.
+
+    def update_ports(self, ip, ports):
+        row = self._rows.get(ip)
+        if row is None:
+            return
+        ports_text = ",".join(str(p) for p in ports) if ports else "-"
+        item = self.model.item(row, 5)
+        if item is None:
+            item = QtGui.QStandardItem(ports_text)
+            self.model.setItem(row, 5, item)
+        else:
+            item.setText(ports_text)
+        self.update_web_column(row)
+
+    def merge_identity(self, ip, name, mac):
+        row = self._rows.get(ip)
+        if row is None:
+            return
+        if name:
+            item = self.model.item(row, 2)
+            if item is None or not item.text():
+                self.model.setItem(row, 2, QtGui.QStandardItem(name))
+        fm = format_mac(mac)
+        if fm:
+            item = self.model.item(row, 3)
+            if item is None or not item.text():
+                mac_item = QtGui.QStandardItem(fm)
+                mac_item.setFont(self.mono_font)
+                self.model.setItem(row, 3, mac_item)
+            vendor = vendor_for_mac(fm, self._oui_db)
+            if vendor:
+                v_item = self.model.item(row, 4)
+                if v_item is None or not v_item.text():
+                    self.model.setItem(row, 4, QtGui.QStandardItem(vendor))
+        self.update_web_column(row)
+
+    def apply_name(self, ip, name):
+        if not name:
+            return
+        row = self._rows.get(ip)
+        if row is None:
+            return
+        item = self.model.item(row, 1)
+        if item is None or not item.text():
+            self.model.setItem(row, 2, QtGui.QStandardItem(name))
+        self.update_web_column(row)
+
+    def scan_finished(self, count):
+        self.scan_btn.setEnabled(True)
+        self.status.setText(f"Done ({count} devices)")
+
+    def on_tab_changed(self, index):
+        tab = self.tabs.tabText(index)
+        if tab == "Network Status":
+            self.start_status_checks()
+            self.apply_auto_refresh()
+        elif tab == "Local Devices":
+            self.status_timer.stop()
+            self.start_scan()
+
+    def start_status_checks(self):
+        vprint("[netview] status: start")
+        if self._status_running:
+            return
+        self._status_running = True
+        self.status_retry.setEnabled(False)
+        self.status_timeout_enable.emit(False)
+        self.status_retries_enable.emit(False)
+        self.status_text.setText("Checking network...")
+        self.status_model.removeRows(0, self.status_model.rowCount())
+        dns_servers = get_dns_servers()
+        self._status_dns = dns_servers
+        self._iface_info = get_interface_info()
+        tips = status_tooltips()
+        self._status_row_tooltip = {}
+        self._status_rows = {
+            "Interface status": self.add_status_row_pending("Interface status", self._iface_info.get("ip", ""), tooltip=tips.get("Interface status", "")),
+            "DHCP lease": self.add_status_row_pending("DHCP lease", self._iface_info.get("ip", ""), tooltip=tips.get("DHCP lease", "")),
+            "Local gateway": self.add_status_row_pending("Local gateway", "", tooltip=tips.get("Local gateway", "")),
+            "Gateway ARP": self.add_status_row_pending("Gateway ARP", "", tooltip=tips.get("Gateway ARP", "")),
+            "Default route": self.add_status_row_pending("Default route", "", tooltip=tips.get("Default route", "")),
+            "DNS system resolve": self.add_status_row_pending("DNS system resolve", "", tooltip=tips.get("DNS system resolve", "")),
+            "DNS server 1": self.add_status_row_pending("DNS server 1", "", tooltip=tips.get("DNS server 1", "")) if len(dns_servers) >= 1 else None,
+            "DNS server 2": self.add_status_row_pending("DNS server 2", "", tooltip=tips.get("DNS server 2", "")) if len(dns_servers) >= 2 else None,
+            "Reverse lookup 1.1.1.1": self.add_status_row_pending("Reverse lookup 1.1.1.1", "1.1.1.1", tooltip=tips.get("Reverse lookup 1.1.1.1", "")),
+            "Reverse lookup 8.8.8.8": self.add_status_row_pending("Reverse lookup 8.8.8.8", "8.8.8.8", tooltip=tips.get("Reverse lookup 8.8.8.8", "")),
+            "Ping 8.8.8.8": self.add_status_row_pending("Ping 8.8.8.8", "8.8.8.8", tooltip=tips.get("Ping 8.8.8.8", "")),
+            "Ping 1.1.1.1": self.add_status_row_pending("Ping 1.1.1.1", "1.1.1.1", tooltip=tips.get("Ping 1.1.1.1", "")),
+            "Ping heise.de": self.add_status_row_pending("Ping heise.de", "", tooltip=tips.get("Ping heise.de", "")),
+            "TCP 443 heise.de": self.add_status_row_pending("TCP 443 heise.de", "", tooltip=tips.get("TCP 443 heise.de", "")),
+            "HTTP 204 check": self.add_status_row_pending("HTTP 204 check", "", tooltip=tips.get("HTTP 204 check", "")),
+            "Apple captive check": self.add_status_row_pending("Apple captive check", "", tooltip=tips.get("Apple captive check", "")),
+            "Traceroute 8.8.8.8": self.add_status_row_pending("Traceroute 8.8.8.8", "", tooltip=tips.get("Traceroute 8.8.8.8", "")),
+            "DNS hijack check": self.add_status_row_pending("DNS hijack check", "", tooltip=tips.get("DNS hijack check", "")),
+        }
+        for key, row in self._status_rows.items():
+            if row is not None:
+                self._status_row_tooltip[row] = tips.get(key, "")
+        thread = threading.Thread(target=self.run_status_checks, daemon=True)
+        thread.start()
+
+    def add_status_row_pending(self, test, ip="", details="", tooltip=""):
+        row = self.status_model.rowCount()
+        self.status_model.insertRow(row)
+        item = QtGui.QStandardItem("\U0001F501")
+        item.setForeground(QtGui.QBrush(QtGui.QColor("#6E6E73")))
+        self.status_model.setItem(row, 0, item)
+        self.status_model.setItem(row, 1, QtGui.QStandardItem(test))
+        self.status_model.setItem(row, 2, QtGui.QStandardItem(ip))
+        self.status_model.setItem(row, 3, QtGui.QStandardItem(""))
+        self.status_model.setItem(row, 4, QtGui.QStandardItem(details))
+        if tooltip:
+            for col in range(5):
+                it = self.status_model.item(row, col)
+                if it is not None:
+                    it.setToolTip(tooltip)
+        return row
+
+    def update_status_row(self, row, ok, details, ip="", ping=""):
+        status_icon = "✅" if ok else "❌"
+        item = QtGui.QStandardItem(status_icon)
+        item.setForeground(QtGui.QBrush(QtGui.QColor("#1E8E3E" if ok else "#D93025")))
+        self.status_model.setItem(row, 0, item)
+        if ip:
+            self.status_model.setItem(row, 2, QtGui.QStandardItem(ip))
+        if ping:
+            self.status_model.setItem(row, 3, QtGui.QStandardItem(ping))
+        self.status_model.setItem(row, 4, QtGui.QStandardItem(details))
+        tip = getattr(self, "_status_row_tooltip", {}).get(row, "")
+        if tip:
+            for col in range(5):
+                it = self.status_model.item(row, col)
+                if it is not None:
+                    it.setToolTip(tip)
+
+    def ensure_device_column_widths(self):
+        # Keep Name and Vendor columns comfortably wide.
+        name_w = max(self.view.columnWidth(2), 220)
+        vendor_w = max(self.view.columnWidth(4), 240)
+        self.view.setColumnWidth(2, name_w)
+        self.view.setColumnWidth(4, vendor_w)
+        self.view.setColumnWidth(1, 40)
+
+    def update_web_column(self, row):
+        name = self.model.item(row, 2)
+        ip_item = self.model.item(row, 0)
+        ports_item = self.model.item(row, 5)
+        host = (name.text() if name and name.text() else "").strip()
+        if not host:
+            host = ip_item.text() if ip_item else ""
+        ports = ports_item.text() if ports_item else ""
+        url = ""
+        if "80" in ports.split(",") or "443" in ports.split(","):
+            url = f"http://{host}"
+        item = self.model.item(row, 1)
+        if item is None:
+            item = QtGui.QStandardItem("")
+            self.model.setItem(row, 1, item)
+        if url:
+            item.setText("🌐")
+            item.setData(url, QtCore.Qt.UserRole)
+            item.setTextAlignment(QtCore.Qt.AlignCenter)
+        else:
+            item.setText("")
+            item.setData("", QtCore.Qt.UserRole)
+
+    def on_device_clicked(self, index):
+        if not index.isValid():
+            return
+        model = self.view.model()
+        if isinstance(model, QtCore.QSortFilterProxyModel):
+            source_index = model.mapToSource(index)
+            source_model = model.sourceModel()
+        else:
+            source_index = index
+            source_model = model
+        if source_index.column() != 1:
+            return
+        item = source_model.item(source_index.row(), source_index.column())
+        url = item.data(QtCore.Qt.UserRole) if item else ""
+        if url:
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl(url))
+
+    def show_table_context_menu(self, pos):
+        view = self.sender()
+        if not isinstance(view, QtWidgets.QAbstractItemView):
+            return
+        index = view.indexAt(pos)
+        if not index.isValid():
+            return
+        model = view.model()
+        # Map proxy index to source if needed
+        if isinstance(model, QtCore.QSortFilterProxyModel):
+            source_index = model.mapToSource(index)
+            source_model = model.sourceModel()
+        else:
+            source_index = index
+            source_model = model
+
+        row = source_index.row()
+        col = source_index.column()
+        cell_text = source_model.data(source_index, QtCore.Qt.DisplayRole)
+        row_values = []
+        for c in range(source_model.columnCount()):
+            idx = source_model.index(row, c)
+            val = source_model.data(idx, QtCore.Qt.DisplayRole)
+            if c == 1:
+                url = source_model.data(idx, QtCore.Qt.UserRole)
+                val = url or ""
+            row_values.append(val)
+        def csv_escape(val):
+            s = "" if val is None else str(val)
+            if any(ch in s for ch in [",", "\"", "\n"]):
+                s = "\"" + s.replace("\"", "\"\"") + "\""
+            return s
+        row_text = ",".join(csv_escape(v) for v in row_values)
+
+        menu = QtWidgets.QMenu(view)
+        copy_cell = menu.addAction("Copy Cell")
+        copy_row = menu.addAction("Copy Row")
+        action = menu.exec(view.viewport().mapToGlobal(pos))
+        if action == copy_cell:
+            if source_index.column() == 1:
+                url = source_model.data(source_index, QtCore.Qt.UserRole)
+                QtWidgets.QApplication.clipboard().setText(url or "")
+            else:
+                QtWidgets.QApplication.clipboard().setText("" if cell_text is None else str(cell_text))
+        elif action == copy_row:
+            QtWidgets.QApplication.clipboard().setText(row_text)
+
+    def run_status_checks(self):
+        vprint("[netview] status: worker start")
+        try:
+            ping_timeout = int(self.status_timeout.currentText())
+        except Exception:
+            ping_timeout = 200
+        try:
+            ping_retries = int(self.status_retries.currentText())
+        except Exception:
+            ping_retries = 5
+        tests = []
+        gateway = get_default_gateway()
+        vprint(f"[netview] status: gateway={gateway!r}")
+        dns_servers = getattr(self, "_status_dns", None) or get_dns_servers()
+        vprint(f"[netview] status: dns={dns_servers!r}")
+        iface_info = getattr(self, "_iface_info", {}) or {}
+
+        if gateway:
+            tests.append(("Local gateway", gateway))
+        else:
+            tests.append(("Local gateway", ""))
+
+        if not dns_servers:
+            tests.append(("DNS server 1", ""))
+            tests.append(("DNS server 2", ""))
+        else:
+            for idx, dns in enumerate(dns_servers):
+                tests.append((f"DNS server {idx + 1}", dns))
+            if len(dns_servers) == 1:
+                tests.append(("DNS server 2", ""))
+
+        tests.extend([
+            ("Interface status", "iface"),
+            ("DHCP lease", "iface"),
+            ("Gateway ARP", "gateway"),
+            ("Default route", "gateway"),
+            ("DNS system resolve", "heise.de"),
+            ("Ping 8.8.8.8", "8.8.8.8"),
+            ("Ping 1.1.1.1", "1.1.1.1"),
+            ("Ping heise.de", "heise.de"),
+            ("TCP 443 heise.de", "heise.de:443"),
+            ("HTTP 204 check", "http_204"),
+            ("Apple captive check", "http_apple"),
+            ("Traceroute 8.8.8.8", "8.8.8.8"),
+            ("Reverse lookup 1.1.1.1", "1.1.1.1"),
+            ("Reverse lookup 8.8.8.8", "8.8.8.8"),
+            ("DNS hijack check", "heise.de"),
+        ])
+
+        row_map = getattr(self, "_status_rows", {})
+        results = {}
+        def run_test(test, host):
+            vprint(f"[netview] status: ping {test} -> {host}")
+            if test == "Interface status":
+                up = iface_info.get("up", False)
+                ip = iface_info.get("ip", "")
+                netmask = iface_info.get("netmask", "")
+                details = f"{iface_info.get('iface','')} {netmask}".strip()
+                if not up and not details:
+                    details = "interface down or no IP"
+                return test, up, details, ip, ""
+            if test == "DHCP lease":
+                lease = get_dhcp_lease_info(iface_info.get("iface", ""))
+                ok = lease not in ("Not supported", "Not available")
+                return test, ok, lease, iface_info.get("ip", ""), ""
+            if test == "Gateway ARP":
+                if not gateway:
+                    return test, False, "Not found", "", ""
+                arp = parse_arp_table()
+                ok = gateway in arp
+                return test, ok, arp.get(gateway, {}).get("mac", "not found"), gateway, ""
+            if test == "Default route":
+                ok = bool(gateway)
+                return test, ok, gateway or "Not found", gateway, ""
+            if test == "DNS system resolve":
+                ip = resolve_host("heise.de")
+                ok = bool(ip)
+                return test, ok, "" if ok else "resolve failed", ip, ""
+            if test.startswith("DNS server"):
+                ip = resolve_host_via_dns("heise.de", host)
+                ok = bool(ip)
+                return test, ok, "" if ok else "resolve failed", ip or host, ""
+            if test == "Reverse lookup 1.1.1.1":
+                name = reverse_lookup("1.1.1.1")
+                ok = bool(name)
+                return test, ok, name or "reverse failed", "1.1.1.1", ""
+            if test == "Reverse lookup 8.8.8.8":
+                name = reverse_lookup("8.8.8.8")
+                ok = bool(name)
+                return test, ok, name or "reverse failed", "8.8.8.8", ""
+            if test == "TCP 443 heise.de":
+                ok = tcp_connect("heise.de", 443, timeout=1.5)
+                ip = resolve_host("heise.de")
+                return test, ok, "" if ok else "connect failed", ip, ""
+            if test == "HTTP 204 check":
+                ok, msg, ip = http_204_check(timeout=2.0)
+                return test, ok, msg if not ok else "", ip, ""
+            if test == "Apple captive check":
+                ok, msg, ip = http_apple_captive_check(timeout=2.0)
+                return test, ok, msg if not ok else "", ip, ""
+            if test == "Traceroute 8.8.8.8":
+                ok, msg = traceroute_host("8.8.8.8", timeout=3.0)
+                return test, ok, msg, "8.8.8.8", ""
+            if test == "DNS hijack check":
+                ip = resolve_host("heise.de")
+                try:
+                    ok = bool(ip) and not ipaddress.ip_address(ip).is_private
+                except Exception:
+                    ok = False
+                return test, ok, "" if ok else "private IP", ip, ""
+
+            ok, ms, ip, failed = ping_with_retries(host, timeout_ms=ping_timeout, attempts=ping_retries)
+            details = "" if ok else f"{host} timeout"
+            if failed:
+                details = (details + " " if details else "") + f"failed {failed}/{ping_retries}"
+            if ok and failed:
+                details = f"had {failed}/{ping_retries} failures"
+            ip_show = ip or (host if host and all(c.isdigit() or c == "." for c in host) else "")
+            vprint(f"[netview] status: result {test} ok={ok} details={details!r}")
+            return test, ok, details, ip_show, ms or ("n/a" if ok else "")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as exe:
+            for test, host in tests:
+                if not host:
+                    row = row_map.get(test)
+                    if row is not None:
+                        self.status_row_update.emit(row, False, "Not found", "", "")
+            future_map = {exe.submit(run_test, t, h): t for t, h in tests if h}
+            for fut in concurrent.futures.as_completed(future_map):
+                test, ok, details, ip_show, ms = safe_result(fut, default=(None, False, "timeout", "", ""))
+                if not test:
+                    continue
+                results[test] = ok
+                row = row_map.get(test)
+                if row is None:
+                    continue
+                self.status_row_update.emit(row, ok, details, ip_show, ms)
+        vprint("[netview] status: worker done")
+
+        def summarize():
+            gw_ok = results.get("Local gateway", False)
+            inet_ok = results.get("Ping 8.8.8.8", False) or results.get("Ping 1.1.1.1", False)
+            dns_ok = results.get("Ping heise.de", False)
+            if not gw_ok:
+                return "Local network unreachable"
+            if not inet_ok:
+                return "Internet unreachable"
+            if inet_ok and not dns_ok:
+                return "DNS error"
+            return "Internet access OK"
+
+        summary = summarize()
+        vprint(f"[netview] status: summary={summary}")
+        self.status_summary.emit(summary)
+        self.status_retry_enable.emit(True)
+        self.status_timeout_enable.emit(True)
+        self.status_retries_enable.emit(True)
+        self._status_running = False
+
+    def on_timeout_changed(self, _index):
+        if self.tabs.tabText(self.tabs.currentIndex()) == "Network Status":
+            self.start_status_checks()
+
+    def on_retries_changed(self, _index):
+        if self.tabs.tabText(self.tabs.currentIndex()) == "Network Status":
+            self.start_status_checks()
+
+    def on_refresh_changed(self, _index):
+        if self.tabs.tabText(self.tabs.currentIndex()) == "Network Status":
+            self.apply_auto_refresh()
+
+    def on_status_timer(self):
+        if self.tabs.tabText(self.tabs.currentIndex()) == "Network Status":
+            self.start_status_checks()
+
+    def apply_auto_refresh(self):
+        text = self.status_refresh.currentText()
+        if text == "Off":
+            self.status_timer.stop()
+            return
+        multipliers = {"s": 1, "m": 60, "h": 3600}
+        try:
+            if text[-1] in multipliers:
+                interval = int(text[:-1]) * multipliers[text[-1]]
+            else:
+                interval = int(text)
+        except Exception:
+            self.status_timer.stop()
+            return
+        self.status_timer.start(interval * 1000)
+        if self.tabs.tabText(self.tabs.currentIndex()) == "Network Status":
+            self.start_status_checks()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="netview network scanner")
+    parser.add_argument("-v", "--verbose", action="count", default=0, help="increase verbosity")
+    args = parser.parse_args()
+    global VERBOSE
+    VERBOSE = args.verbose
+    app = QtWidgets.QApplication([])
+    if "macos" in [s.lower() for s in QtWidgets.QStyleFactory.keys()]:
+        app.setStyle("macos")
+    # Let terminal Ctrl-C terminate the process normally.
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    win = NetViewQt()
+    win.show()
+    app.exec()
+
+
+if __name__ == "__main__":
+    main()
