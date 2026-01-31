@@ -110,6 +110,14 @@ def write_config(cfg):
     lines.append(f'devices_auto = "{ui.get("devices_auto", "Off")}"')
     lines.append(f'show_domain = "{ui.get("show_domain", "Off")}"')
     lines.append(f'tasmota_auto = "{ui.get("tasmota_auto", "Off")}"')
+    lines.append(f'devices_sort_col = "{ui.get("devices_sort_col", "0")}"')
+    lines.append(f'devices_sort_order = "{ui.get("devices_sort_order", "asc")}"')
+    lines.append(f'status_sort_col = "{ui.get("status_sort_col", "0")}"')
+    lines.append(f'status_sort_order = "{ui.get("status_sort_order", "asc")}"')
+    lines.append(f'tasmota_sort_col = "{ui.get("tasmota_sort_col", "0")}"')
+    lines.append(f'tasmota_sort_order = "{ui.get("tasmota_sort_order", "asc")}"')
+    lines.append(f'prereq_sort_col = "{ui.get("prereq_sort_col", "0")}"')
+    lines.append(f'prereq_sort_order = "{ui.get("prereq_sort_order", "asc")}"')
     lines.append(f'ping_timeout = "{ui.get("ping_timeout", "200")}"')
     lines.append(f'ping_retries = "{ui.get("ping_retries", "5")}"')
     try:
@@ -986,6 +994,7 @@ class NetViewQt(QtWidgets.QMainWindow):
 
         self.status_view = QtWidgets.QTableView()
         self.status_view.setModel(self.status_model)
+        self.status_view.setSortingEnabled(True)
         self.status_view.horizontalHeader().setStretchLastSection(True)
         self.status_view.verticalHeader().setVisible(False)
         self.status_view.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
@@ -1029,6 +1038,7 @@ class NetViewQt(QtWidgets.QMainWindow):
         )
         self.tasmota_view = QtWidgets.QTableView()
         self.tasmota_view.setModel(self.tasmota_model)
+        self.tasmota_view.setSortingEnabled(True)
         t_header = self.tasmota_view.horizontalHeader()
         t_header.setStretchLastSection(False)
         for col in range(0, 10):
@@ -1085,6 +1095,7 @@ class NetViewQt(QtWidgets.QMainWindow):
         self.prereq_model.setHorizontalHeaderLabels(["Status", "Tool", "Path"])
         self.prereq_view = QtWidgets.QTableView()
         self.prereq_view.setModel(self.prereq_model)
+        self.prereq_view.setSortingEnabled(True)
         self.prereq_view.horizontalHeader().setStretchLastSection(True)
         self.prereq_view.verticalHeader().setVisible(False)
         self.prereq_view.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
@@ -1108,6 +1119,10 @@ class NetViewQt(QtWidgets.QMainWindow):
         self.ensure_device_column_widths()
         self.tasmota_view.verticalHeader().setDefaultSectionSize(28)
         self.prereq_view.verticalHeader().setDefaultSectionSize(28)
+        self.view.horizontalHeader().sortIndicatorChanged.connect(self.on_table_sort_changed)
+        self.status_view.horizontalHeader().sortIndicatorChanged.connect(self.on_table_sort_changed)
+        self.tasmota_view.horizontalHeader().sortIndicatorChanged.connect(self.on_table_sort_changed)
+        self.prereq_view.horizontalHeader().sortIndicatorChanged.connect(self.on_table_sort_changed)
 
         self.worker = ScanWorker()
         self.worker.upsert.connect(self.upsert_row)
@@ -1515,8 +1530,8 @@ class NetViewQt(QtWidgets.QMainWindow):
         set_item(10, model)
         self.tasmota_view.resizeColumnsToContents()
         self.tasmota_view.setColumnWidth(3, 30)
-        # Keep sorted by Name
-        self.tasmota_view.sortByColumn(0, QtCore.Qt.AscendingOrder)
+        header = self.tasmota_view.horizontalHeader()
+        self.tasmota_view.sortByColumn(header.sortIndicatorSection(), header.sortIndicatorOrder())
 
     def on_tasmota_item_changed(self, item):
         if self._tasmota_updating:
@@ -1616,6 +1631,18 @@ class NetViewQt(QtWidgets.QMainWindow):
         ui["devices_auto"] = self.devices_refresh_box.currentText()
         ui["show_domain"] = "On" if self.show_domain_box.isChecked() else "Off"
         ui["tasmota_auto"] = self.tasmota_refresh_box.currentText()
+        d_header = self.view.horizontalHeader()
+        ui["devices_sort_col"] = str(d_header.sortIndicatorSection())
+        ui["devices_sort_order"] = "desc" if d_header.sortIndicatorOrder() == QtCore.Qt.DescendingOrder else "asc"
+        s_header = self.status_view.horizontalHeader()
+        ui["status_sort_col"] = str(s_header.sortIndicatorSection())
+        ui["status_sort_order"] = "desc" if s_header.sortIndicatorOrder() == QtCore.Qt.DescendingOrder else "asc"
+        t_header = self.tasmota_view.horizontalHeader()
+        ui["tasmota_sort_col"] = str(t_header.sortIndicatorSection())
+        ui["tasmota_sort_order"] = "desc" if t_header.sortIndicatorOrder() == QtCore.Qt.DescendingOrder else "asc"
+        p_header = self.prereq_view.horizontalHeader()
+        ui["prereq_sort_col"] = str(p_header.sortIndicatorSection())
+        ui["prereq_sort_order"] = "desc" if p_header.sortIndicatorOrder() == QtCore.Qt.DescendingOrder else "asc"
         ui["ping_timeout"] = self.status_timeout.currentText()
         ui["ping_retries"] = self.status_retries.currentText()
         self._config["ui"] = ui
@@ -1671,6 +1698,10 @@ class NetViewQt(QtWidgets.QMainWindow):
             self.status_timeout.setCurrentText(ui.get("ping_timeout"))
         if ui.get("ping_retries"):
             self.status_retries.setCurrentText(ui.get("ping_retries"))
+        self.apply_table_sort(self.view, ui.get("devices_sort_col"), ui.get("devices_sort_order"))
+        self.apply_table_sort(self.status_view, ui.get("status_sort_col"), ui.get("status_sort_order"))
+        self.apply_table_sort(self.tasmota_view, ui.get("tasmota_sort_col"), ui.get("tasmota_sort_order"))
+        self.apply_table_sort(self.prereq_view, ui.get("prereq_sort_col"), ui.get("prereq_sort_order"))
         tab = ui.get("tab")
         if tab:
             for i in range(self.tabs.count()):
@@ -1908,6 +1939,19 @@ class NetViewQt(QtWidgets.QMainWindow):
             ip = ip_item.text() if ip_item else ""
             self.set_name_item(row, ip)
         self.schedule_config_write()
+
+    def on_table_sort_changed(self, _section, _order):
+        self.schedule_config_write()
+
+    def apply_table_sort(self, view, col, order):
+        if col is None or order is None:
+            return
+        try:
+            col_idx = int(col)
+        except Exception:
+            return
+        ord_val = QtCore.Qt.DescendingOrder if str(order).lower() == "desc" else QtCore.Qt.AscendingOrder
+        view.sortByColumn(col_idx, ord_val)
 
     def user_name_for_row(self, row, ip):
         mac_item = self.model.item(row, 4)
