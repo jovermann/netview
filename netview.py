@@ -726,9 +726,12 @@ class SortProxy(QtCore.QSortFilterProxyModel):
         if col == 0:
             return ip_key(lval) < ip_key(rval)
         if col == 2:
-            lstate = left.data(QtCore.Qt.CheckStateRole) == QtCore.Qt.Checked
-            rstate = right.data(QtCore.Qt.CheckStateRole) == QtCore.Qt.Checked
-            return (0 if not lstate else 1) < (0 if not rstate else 1)
+            lval = left.data(QtCore.Qt.UserRole)
+            rval = right.data(QtCore.Qt.UserRole)
+            try:
+                return int(lval or 0) < int(rval or 0)
+            except Exception:
+                return False
         if col == 6:
             return ports_key(lval) < ports_key(rval)
         return str(lval).lower() < str(rval).lower()
@@ -1116,6 +1119,7 @@ class NetViewQt(QtWidgets.QMainWindow):
         vprint(f"[netview] known: loaded macs={len(self._known_store_macs)} names={len(self._known_store_names)}")
         self._known_updating = False
         self._name_updating = False
+        self._known_programmatic = 0
         self._name_programmatic = 0
         self.model.itemChanged.connect(self.on_known_item_changed)
         self.model.itemChanged.connect(self.on_name_item_changed)
@@ -1191,7 +1195,8 @@ class NetViewQt(QtWidgets.QMainWindow):
         self.update_web_column(row)
         self.update_known_column(row, mac)
         self._known_updating = False
-        self.view.sortByColumn(0, QtCore.Qt.AscendingOrder)
+        header = self.view.horizontalHeader()
+        self.view.sortByColumn(header.sortIndicatorSection(), header.sortIndicatorOrder())
         self.view.resizeColumnsToContents()
         self.ensure_device_column_widths()
         # Auto-size status table columns to contents.
@@ -1746,10 +1751,14 @@ class NetViewQt(QtWidgets.QMainWindow):
             self.model.setItem(row, 2, item)
         item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsSelectable)
         self._known_updating = True
-        item.setCheckState(QtCore.Qt.Checked if raw in self._known_store_macs else QtCore.Qt.Unchecked)
+        self._known_programmatic += 1
+        checked = QtCore.Qt.Checked if raw in self._known_store_macs else QtCore.Qt.Unchecked
+        item.setCheckState(checked)
+        item.setData(1 if checked == QtCore.Qt.Checked else 0, QtCore.Qt.UserRole)
+        QtCore.QTimer.singleShot(0, self._end_known_programmatic_update)
         self._known_updating = False
     def on_known_item_changed(self, item):
-        if self._known_updating:
+        if self._known_updating or self._known_programmatic > 0:
             return
         if item.column() != 2:
             return
@@ -1773,6 +1782,10 @@ class NetViewQt(QtWidgets.QMainWindow):
         ip = ip_item.text() if ip_item else ""
         self.set_name_item(item.row(), ip)
         self.schedule_config_write()
+
+    def _end_known_programmatic_update(self):
+        if self._known_programmatic > 0:
+            self._known_programmatic -= 1
 
     def name_suffixes_for_ip(self, ip):
         suffixes = []
