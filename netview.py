@@ -68,6 +68,7 @@ def write_config(cfg):
     lines.append(f'tab = "{ui.get("tab", "Network Status")}"')
     lines.append(f'status_auto = "{ui.get("status_auto", "Off")}"')
     lines.append(f'devices_auto = "{ui.get("devices_auto", "Off")}"')
+    lines.append(f'show_domain = "{ui.get("show_domain", "Off")}"')
     lines.append(f'tasmota_auto = "{ui.get("tasmota_auto", "Off")}"')
     lines.append(f'ping_timeout = "{ui.get("ping_timeout", "200")}"')
     lines.append(f'ping_retries = "{ui.get("ping_retries", "5")}"')
@@ -1001,7 +1002,12 @@ class NetViewQt(QtWidgets.QMainWindow):
         devices_bar.setSpacing(12)
         self.refresh_btn = QtWidgets.QPushButton("Refresh")
         self.refresh_btn.clicked.connect(self.start_scan)
-        self.status = QtWidgets.QLabel("Idle")
+        self.status = QtWidgets.QLineEdit("Idle")
+        self.status.setReadOnly(True)
+        self.status.setMinimumWidth(220)
+        self.show_domain_box = QtWidgets.QCheckBox("Show domain")
+        self.show_domain_box.setChecked(False)
+        self.show_domain_box.stateChanged.connect(self.on_show_domain_changed)
         self.devices_refresh_box = QtWidgets.QComboBox()
         self.devices_refresh_box.addItems(["Off", "10s", "15s", "20s", "30s", "60s", "2m", "5m", "10m", "30m", "1h"])
         self.devices_refresh_box.setCurrentText("Off")
@@ -1009,6 +1015,7 @@ class NetViewQt(QtWidgets.QMainWindow):
         devices_bar.addWidget(self.refresh_btn)
         devices_bar.addWidget(QtWidgets.QLabel("Auto-Refresh:"))
         devices_bar.addWidget(self.devices_refresh_box)
+        devices_bar.addWidget(self.show_domain_box)
         devices_bar.addWidget(self.status)
         devices_bar.addStretch(1)
         devices_layout.addLayout(devices_bar)
@@ -1545,6 +1552,7 @@ class NetViewQt(QtWidgets.QMainWindow):
         ui["tab"] = base_tab_name(self.tabs.tabText(self.tabs.currentIndex()))
         ui["status_auto"] = self.status_refresh.currentText()
         ui["devices_auto"] = self.devices_refresh_box.currentText()
+        ui["show_domain"] = "On" if self.show_domain_box.isChecked() else "Off"
         ui["tasmota_auto"] = self.tasmota_refresh_box.currentText()
         ui["ping_timeout"] = self.status_timeout.currentText()
         ui["ping_retries"] = self.status_retries.currentText()
@@ -1558,6 +1566,9 @@ class NetViewQt(QtWidgets.QMainWindow):
             self.status_refresh.setCurrentText(ui.get("status_auto"))
         if ui.get("devices_auto"):
             self.devices_refresh_box.setCurrentText(ui.get("devices_auto"))
+        show_domain = ui.get("show_domain")
+        if show_domain:
+            self.show_domain_box.setChecked(show_domain == "On")
         if ui.get("tasmota_auto"):
             self.tasmota_refresh_box.setCurrentText(ui.get("tasmota_auto"))
         if ui.get("ping_timeout"):
@@ -1734,6 +1745,12 @@ class NetViewQt(QtWidgets.QMainWindow):
 
     def format_display_name(self, raw_name, ip):
         raw = (raw_name or "").strip()
+        if raw and not self.show_domain_box.isChecked():
+            try:
+                ipaddress.ip_address(raw)
+            except ValueError:
+                if "." in raw:
+                    raw = raw.split(".", 1)[0]
         suffixes = self.name_suffixes_for_ip(ip)
         if not suffixes:
             return raw
@@ -1751,6 +1768,13 @@ class NetViewQt(QtWidgets.QMainWindow):
         raw = raw_name if raw_name else existing
         item.setData(raw or "", self._name_raw_role)
         item.setText(self.format_display_name(raw, ip))
+
+    def on_show_domain_changed(self, _state):
+        for row in range(self.model.rowCount()):
+            ip_item = self.model.item(row, 0)
+            ip = ip_item.text() if ip_item else ""
+            self.set_name_item(row, ip)
+        self.schedule_config_write()
 
     def on_device_clicked(self, index):
         if not index.isValid():
