@@ -47,19 +47,34 @@ def load_config():
 
 def extract_known_hosts(cfg):
     known = cfg.get("known_hosts", {})
-    macs = known.get("macs", [])
     out = set()
-    for m in macs:
-        m = str(m).strip().upper().replace(":", "").replace("-", "")
-        if m:
-            out.add(m)
     names = {}
-    for key, val in (known.get("names", {}) or {}).items():
-        k = str(key).strip().upper().replace(":", "").replace("-", "")
-        v = str(val).strip()
-        if k and v:
-            names[k] = v
+    if "macs" in known or "names" in known:
+        macs = known.get("macs", [])
+        for m in macs:
+            m = str(m).strip().upper().replace(":", "").replace("-", "")
+            if m:
+                out.add(m)
+        for key, val in (known.get("names", {}) or {}).items():
+            k = str(key).strip().upper().replace(":", "").replace("-", "")
+            v = str(val).strip()
+            if k:
+                out.add(k)
+                if v:
+                    names[k] = v
+    else:
+        for key, val in known.items():
+            k = str(key).strip().upper().replace(":", "").replace("-", "")
+            if not k:
+                continue
             out.add(k)
+            name = ""
+            if isinstance(val, (list, tuple)) and val:
+                name = str(val[0]).strip()
+            elif isinstance(val, str):
+                name = val.strip()
+            if name:
+                names[k] = name
     return out, names
 
 
@@ -67,20 +82,23 @@ def write_config(cfg):
     path = Path.home() / ".netviewrc.toml"
     lines = []
     # known hosts
-    macs = sorted(cfg.get("known_hosts", {}).get("macs", []))
-    names = cfg.get("known_hosts", {}).get("names", {}) or {}
+    known = cfg.get("known_hosts", {}) or {}
+    macs = sorted(known.get("macs", [])) if "macs" in known else sorted(known.keys())
+    names = known.get("names", {}) or {}
     lines.append("[known_hosts]")
-    lines.append("macs = [")
     for m in macs:
-        lines.append(f'  "{m}",')
-    lines.append("]")
-    if names:
-        lines.append("")
-        lines.append("[known_hosts.names]")
-        for k in sorted(names.keys()):
-            key = json.dumps(str(k))
-            val = json.dumps(str(names.get(k, "")))
-            lines.append(f"{key} = {val}")
+        name = ""
+        if isinstance(known, dict) and "names" not in known:
+            val = known.get(m, [])
+            if isinstance(val, (list, tuple)) and val:
+                name = str(val[0]).strip()
+            elif isinstance(val, str):
+                name = val.strip()
+        else:
+            name = str(names.get(m, "")).strip()
+        key = json.dumps(str(m))
+        val = json.dumps([name])
+        lines.append(f"{key} = {val}")
     lines.append("")
     # ui settings
     ui = cfg.get("ui", {})
@@ -1595,8 +1613,11 @@ class NetViewQt(QtWidgets.QMainWindow):
         ui["ping_timeout"] = self.status_timeout.currentText()
         ui["ping_retries"] = self.status_retries.currentText()
         self._config["ui"] = ui
-        names = {k: v for k, v in self._known_store_names.items() if v}
-        self._config["known_hosts"] = {"macs": sorted(self._known_store_macs), "names": names}
+        known = {}
+        for mac in sorted(self._known_store_macs):
+            name = self._known_store_names.get(mac, "")
+            known[mac] = [name]
+        self._config["known_hosts"] = known
         write_config(self._config)
 
     def apply_saved_ui(self):
