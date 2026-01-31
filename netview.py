@@ -14,6 +14,7 @@ import threading
 import urllib.request
 import urllib.error
 from pathlib import Path
+import tomllib
 
 from PySide6 import QtCore, QtGui, QtWidgets
 import signal
@@ -24,6 +25,36 @@ VERBOSE = 0
 def vprint(msg, level=1):
     if VERBOSE >= level:
         print(msg, flush=True)
+
+
+def load_known_hosts():
+    path = Path.home() / ".netviewrc.toml"
+    if not path.exists():
+        return set()
+    try:
+        data = tomllib.loads(path.read_text())
+    except Exception:
+        return set()
+    macs = data.get("known_hosts", {}).get("macs", [])
+    out = set()
+    for m in macs:
+        m = str(m).strip().upper().replace(":", "").replace("-", "")
+        if m:
+            out.add(m)
+    return out
+
+
+def save_known_hosts(macs):
+    path = Path.home() / ".netviewrc.toml"
+    mac_list = sorted(macs)
+    content = ["[known_hosts]", "macs = ["]
+    for m in mac_list:
+        content.append(f'  "{m}",')
+    content.append("]")
+    try:
+        path.write_text("\n".join(content) + "\n")
+    except Exception:
+        pass
 
 
 def get_local_ip(timeout=1.0):
@@ -651,7 +682,11 @@ class SortProxy(QtCore.QSortFilterProxyModel):
 
         if col == 0:
             return ip_key(lval) < ip_key(rval)
-        if col == 5:
+        if col == 2:
+            lstate = left.data(QtCore.Qt.CheckStateRole) == QtCore.Qt.Checked
+            rstate = right.data(QtCore.Qt.CheckStateRole) == QtCore.Qt.Checked
+            return (0 if not lstate else 1) < (0 if not rstate else 1)
+        if col == 6:
             return ports_key(lval) < ports_key(rval)
         return str(lval).lower() < str(rval).lower()
 
@@ -808,9 +843,9 @@ class NetViewQt(QtWidgets.QMainWindow):
         self._tab_index_tasmota = None
         self._tab_index_prereq = None
 
-        self.model = QtGui.QStandardItemModel(0, 6, self)
+        self.model = QtGui.QStandardItemModel(0, 7, self)
         self.model.setHorizontalHeaderLabels(
-            ["IP Address", "Web", "Name", "MAC", "MAC Vendor", "Ports"]
+            ["IP Address", "Web", "Known", "Name", "MAC", "MAC Vendor", "Ports"]
         )
 
         self.proxy = SortProxy(self)
@@ -947,7 +982,9 @@ class NetViewQt(QtWidgets.QMainWindow):
         devices_bar.addWidget(self.devices_refresh_box)
         devices_bar.addStretch(1)
         devices_layout.addLayout(devices_bar)
+
         devices_layout.addWidget(self.view)
+
         self._tab_index_devices = self.tabs.addTab(devices_tab, "Local Devices")
         self._tab_index_tasmota = self.tabs.addTab(tasmota_tab, "Tasmota Switches")
 
@@ -1011,6 +1048,9 @@ class NetViewQt(QtWidgets.QMainWindow):
         self.devices_timer = QtCore.QTimer(self)
         self.devices_timer.timeout.connect(self.on_devices_timer)
         self._prereq_rows = []
+        self._known_macs = load_known_hosts()
+        self._known_updating = False
+        self.model.itemChanged.connect(self.on_known_item_changed)
 
         # Allow quitting with Ctrl+C even when the app has focus.
         QtWidgets.QApplication.instance().installEventFilter(self)
@@ -1046,7 +1086,7 @@ class NetViewQt(QtWidgets.QMainWindow):
         row = self._rows.get(ip)
         fm = format_mac(mac)
         vendor = vendor_for_mac(fm, self._oui_db)
-        values = [ip, "", name, fm, vendor, ports]
+        values = [ip, "", "", name, fm, vendor, ports]
         if row is None:
             row = self.model.rowCount()
             self.model.insertRow(row)
@@ -1055,20 +1095,23 @@ class NetViewQt(QtWidgets.QMainWindow):
             self.status.setText(f"Scanning... ({self._scan_count} devices)")
             self.update_tab_counts()
 
+        self._known_updating = True
         for col, val in enumerate(values):
             item = self.model.item(row, col)
             if item is None:
                 item = QtGui.QStandardItem(str(val))
-                if col == 3:
+                if col == 4:
                     item.setFont(self.mono_font)
-                if col == 4 and str(val).startswith("(") and str(val).endswith(")"):
+                if col == 5 and str(val).startswith("(") and str(val).endswith(")"):
                     item.setForeground(QtGui.QBrush(QtGui.QColor("#6E6E73")))
                 self.model.setItem(row, col, item)
             else:
                 item.setText(str(val))
-                if col == 4 and str(val).startswith("(") and str(val).endswith(")"):
+                if col == 5 and str(val).startswith("(") and str(val).endswith(")"):
                     item.setForeground(QtGui.QBrush(QtGui.QColor("#6E6E73")))
         self.update_web_column(row)
+        self.update_known_column(row, mac)
+        self._known_updating = False
         self.view.sortByColumn(0, QtCore.Qt.AscendingOrder)
         self.view.resizeColumnsToContents()
         self.ensure_device_column_widths()
@@ -1079,10 +1122,10 @@ class NetViewQt(QtWidgets.QMainWindow):
         if row is None:
             return
         ports_text = ",".join(str(p) for p in ports) if ports else ""
-        item = self.model.item(row, 5)
+        item = self.model.item(row, 6)
         if item is None:
             item = QtGui.QStandardItem(ports_text)
-            self.model.setItem(row, 5, item)
+            self.model.setItem(row, 6, item)
         else:
             item.setText(ports_text)
         self.update_web_column(row)
@@ -1092,25 +1135,26 @@ class NetViewQt(QtWidgets.QMainWindow):
         if row is None:
             return
         if name:
-            item = self.model.item(row, 2)
+            item = self.model.item(row, 3)
             if item is None or not item.text():
-                self.model.setItem(row, 2, QtGui.QStandardItem(name))
+                self.model.setItem(row, 3, QtGui.QStandardItem(name))
         fm = format_mac(mac)
         if fm:
-            item = self.model.item(row, 3)
+            item = self.model.item(row, 4)
             if item is None or not item.text():
                 mac_item = QtGui.QStandardItem(fm)
                 mac_item.setFont(self.mono_font)
-                self.model.setItem(row, 3, mac_item)
+                self.model.setItem(row, 4, mac_item)
             vendor = vendor_for_mac(fm, self._oui_db)
             if vendor:
-                v_item = self.model.item(row, 4)
+                v_item = self.model.item(row, 5)
                 if v_item is None or not v_item.text():
                     v_item = QtGui.QStandardItem(vendor)
                     if vendor.startswith("(") and vendor.endswith(")"):
                         v_item.setForeground(QtGui.QBrush(QtGui.QColor("#6E6E73")))
-                    self.model.setItem(row, 4, v_item)
+                    self.model.setItem(row, 5, v_item)
         self.update_web_column(row)
+        self.update_known_column(row, mac)
 
     def apply_name(self, ip, name):
         if not name:
@@ -1120,7 +1164,7 @@ class NetViewQt(QtWidgets.QMainWindow):
             return
         item = self.model.item(row, 1)
         if item is None or not item.text():
-            self.model.setItem(row, 2, QtGui.QStandardItem(name))
+            self.model.setItem(row, 3, QtGui.QStandardItem(name))
         self.update_web_column(row)
 
     def scan_finished(self, count):
@@ -1224,11 +1268,12 @@ class NetViewQt(QtWidgets.QMainWindow):
 
     def ensure_device_column_widths(self):
         # Keep Name and Vendor columns comfortably wide.
-        name_w = max(self.view.columnWidth(2), 220)
-        vendor_w = max(self.view.columnWidth(4), 240)
-        self.view.setColumnWidth(2, name_w)
-        self.view.setColumnWidth(4, vendor_w)
+        name_w = max(self.view.columnWidth(3), 220)
+        vendor_w = max(self.view.columnWidth(5), 240)
+        self.view.setColumnWidth(3, name_w)
+        self.view.setColumnWidth(5, vendor_w)
         self.view.setColumnWidth(1, 40)
+        self.view.setColumnWidth(2, 30)
 
     def start_tasmota_scan(self):
         if self._tasmota_scanning:
@@ -1537,9 +1582,9 @@ class NetViewQt(QtWidgets.QMainWindow):
             self.tabs.setTabText(self._tab_index_tasmota, f"Tasmota Switches ({len(self._tasmota_rows)})")
 
     def update_web_column(self, row):
-        name = self.model.item(row, 2)
+        name = self.model.item(row, 3)
         ip_item = self.model.item(row, 0)
-        ports_item = self.model.item(row, 5)
+        ports_item = self.model.item(row, 6)
         host = (name.text() if name and name.text() else "").strip()
         if not host:
             host = ip_item.text() if ip_item else ""
@@ -1558,6 +1603,40 @@ class NetViewQt(QtWidgets.QMainWindow):
         else:
             item.setText("")
             item.setData("", QtCore.Qt.UserRole)
+
+    def update_known_column(self, row, mac):
+        fm = format_mac(mac)
+        if not fm:
+            return
+        raw = fm.replace(":", "").upper()
+        item = self.model.item(row, 2)
+        if item is None:
+            item = QtGui.QStandardItem("")
+            self.model.setItem(row, 2, item)
+        item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsSelectable)
+        self._known_updating = True
+        item.setCheckState(QtCore.Qt.Checked if raw in self._known_macs else QtCore.Qt.Unchecked)
+        self._known_updating = False
+
+    def on_known_item_changed(self, item):
+        if self._known_updating:
+            return
+        if item.column() != 2:
+            return
+        # Ignore initial empty checkbox items with no state
+        if item.checkState() not in (QtCore.Qt.Checked, QtCore.Qt.Unchecked):
+            return
+        mac_item = self.model.item(item.row(), 4)
+        if not mac_item:
+            return
+        raw = format_mac(mac_item.text()).replace(":", "").upper()
+        if not raw:
+            return
+        if item.checkState() == QtCore.Qt.Checked:
+            self._known_macs.add(raw)
+        else:
+            self._known_macs.discard(raw)
+        save_known_hosts(self._known_macs)
 
     def on_device_clicked(self, index):
         if not index.isValid():
