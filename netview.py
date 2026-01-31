@@ -87,17 +87,19 @@ def write_config(cfg):
     names = known.get("names", {}) or {}
     lines.append("[known_hosts]")
     for m in macs:
-        name = ""
+        entry = ["", "", "", ""]
         if isinstance(known, dict) and "names" not in known:
             val = known.get(m, [])
-            if isinstance(val, (list, tuple)) and val:
-                name = str(val[0]).strip()
+            if isinstance(val, (list, tuple)):
+                entry = [str(v) for v in list(val)[:4]]
+                while len(entry) < 4:
+                    entry.append("")
             elif isinstance(val, str):
-                name = val.strip()
+                entry[0] = val
         else:
-            name = str(names.get(m, "")).strip()
+            entry[0] = str(names.get(m, "")).strip()
         key = json.dumps(str(m))
-        val = json.dumps([name])
+        val = json.dumps(entry)
         lines.append(f"{key} = {val}")
     lines.append("")
     # ui settings
@@ -1613,10 +1615,40 @@ class NetViewQt(QtWidgets.QMainWindow):
         ui["ping_timeout"] = self.status_timeout.currentText()
         ui["ping_retries"] = self.status_retries.currentText()
         self._config["ui"] = ui
+        known_existing = self._config.get("known_hosts", {}) or {}
         known = {}
         for mac in sorted(self._known_store_macs):
-            name = self._known_store_names.get(mac, "")
-            known[mac] = [name]
+            base = ["", "", "", ""]
+            existing = known_existing.get(mac)
+            if isinstance(existing, (list, tuple)):
+                base = [str(v) for v in list(existing)[:4]]
+                while len(base) < 4:
+                    base.append("")
+            user_name = self._known_store_names.get(mac, "")
+            dns_name = base[1]
+            ip_addr = base[2]
+            vendor = base[3]
+            row = None
+            if mac:
+                for ip, r in self._rows.items():
+                    mac_item = self.model.item(r, 4)
+                    if not mac_item:
+                        continue
+                    if format_mac(mac_item.text()).replace(":", "").upper() == mac:
+                        row = r
+                        break
+            if row is not None:
+                name_item = self.model.item(row, 3)
+                raw_dns = name_item.data(self._name_raw_role) if name_item else ""
+                ip_item = self.model.item(row, 0)
+                vendor_item = self.model.item(row, 5)
+                if raw_dns:
+                    dns_name = str(raw_dns)
+                if ip_item and ip_item.text():
+                    ip_addr = ip_item.text()
+                if vendor_item and vendor_item.text():
+                    vendor = vendor_item.text()
+            known[mac] = [user_name, dns_name, ip_addr, vendor]
         self._config["known_hosts"] = known
         write_config(self._config)
 
