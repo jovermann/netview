@@ -751,10 +751,17 @@ class ScanWorker(QtCore.QObject):
             self._work_q.put((ip, want_name, want_ports))
 
         # Add local machine immediately and enqueue checks
-        local_name = f"{socket.gethostname()} (this machine)"
+        local_name = socket.gethostname()
         self.upsert.emit(local_ip, local_name, "", "Pending")
         found.add(local_ip)
         enqueue_work(local_ip, want_name=False, want_ports=True)
+
+        gateway = get_default_gateway()
+        if gateway and gateway != local_ip and should_include_ip(gateway, net):
+            if gateway not in found:
+                self.upsert.emit(gateway, "", "", "Pending")
+                found.add(gateway)
+            enqueue_work(gateway, want_name=True, want_ports=True)
 
         arp = parse_arp_table()
         for ip, entry in arp.items():
@@ -838,6 +845,9 @@ class NetViewQt(QtWidgets.QMainWindow):
         self._oui_db = load_oui_db()
         self._rows = {}
         self._scan_count = 0
+        self._local_ip = None
+        self._default_gateway = None
+        self._name_raw_role = QtCore.Qt.UserRole + 1
 
         menu = self.menuBar().addMenu("Netview")
         quit_action = QtGui.QAction("Quit", self)
@@ -1101,6 +1111,8 @@ class NetViewQt(QtWidgets.QMainWindow):
         self.status.setText("Scanning...")
         self.clear_table()
         self._scan_count = 0
+        self._local_ip = get_local_ip()
+        self._default_gateway = get_default_gateway()
         self.worker.start()
 
     def clear_table(self):
@@ -1111,7 +1123,7 @@ class NetViewQt(QtWidgets.QMainWindow):
         row = self._rows.get(ip)
         fm = format_mac(mac)
         vendor = vendor_for_mac(fm, self._oui_db)
-        values = [ip, "", "", name, fm, vendor, ports]
+        values = [ip, "", "", "", fm, vendor, ports]
         if row is None:
             row = self.model.rowCount()
             self.model.insertRow(row)
@@ -1122,6 +1134,8 @@ class NetViewQt(QtWidgets.QMainWindow):
 
         self._known_updating = True
         for col, val in enumerate(values):
+            if col == 3:
+                continue
             item = self.model.item(row, col)
             if item is None:
                 item = QtGui.QStandardItem(str(val))
@@ -1134,6 +1148,7 @@ class NetViewQt(QtWidgets.QMainWindow):
                 item.setText(str(val))
                 if col == 5 and str(val).startswith("(") and str(val).endswith(")"):
                     item.setForeground(QtGui.QBrush(QtGui.QColor("#6E6E73")))
+        self.set_name_item(row, ip, name)
         self.update_web_column(row)
         self.update_known_column(row, mac)
         self._known_updating = False
@@ -1161,8 +1176,9 @@ class NetViewQt(QtWidgets.QMainWindow):
             return
         if name:
             item = self.model.item(row, 3)
-            if item is None or not item.text():
-                self.model.setItem(row, 3, QtGui.QStandardItem(name))
+            raw = item.data(self._name_raw_role) if item else ""
+            if not raw:
+                self.set_name_item(row, ip, name)
         fm = format_mac(mac)
         if fm:
             item = self.model.item(row, 4)
@@ -1187,9 +1203,10 @@ class NetViewQt(QtWidgets.QMainWindow):
         row = self._rows.get(ip)
         if row is None:
             return
-        item = self.model.item(row, 1)
-        if item is None or not item.text():
-            self.model.setItem(row, 3, QtGui.QStandardItem(name))
+        item = self.model.item(row, 3)
+        raw = item.data(self._name_raw_role) if item else ""
+        if not raw:
+            self.set_name_item(row, ip, name)
         self.update_web_column(row)
 
     def scan_finished(self, count):
@@ -1649,7 +1666,12 @@ class NetViewQt(QtWidgets.QMainWindow):
         name = self.model.item(row, 3)
         ip_item = self.model.item(row, 0)
         ports_item = self.model.item(row, 6)
-        host = (name.text() if name and name.text() else "").strip()
+        raw = (name.data(self._name_raw_role) if name else "") or ""
+        host = raw.strip()
+        if not host:
+            display = (name.text() if name and name.text() else "").strip()
+            if display and not (display.startswith("(") and display.endswith(")")):
+                host = display
         if not host:
             host = ip_item.text() if ip_item else ""
         ports = ports_item.text() if ports_item else ""
@@ -1701,6 +1723,34 @@ class NetViewQt(QtWidgets.QMainWindow):
         else:
             self._known_macs.discard(raw)
         self.schedule_config_write()
+
+    def name_suffixes_for_ip(self, ip):
+        suffixes = []
+        if self._local_ip and ip == self._local_ip:
+            suffixes.append("this machine")
+        if self._default_gateway and ip == self._default_gateway:
+            suffixes.append("default gateway")
+        return suffixes
+
+    def format_display_name(self, raw_name, ip):
+        raw = (raw_name or "").strip()
+        suffixes = self.name_suffixes_for_ip(ip)
+        if not suffixes:
+            return raw
+        suffix = ", ".join(suffixes)
+        if raw:
+            return f"{raw} ({suffix})"
+        return f"({suffix})"
+
+    def set_name_item(self, row, ip, raw_name=None):
+        item = self.model.item(row, 3)
+        if item is None:
+            item = QtGui.QStandardItem("")
+            self.model.setItem(row, 3, item)
+        existing = item.data(self._name_raw_role) or ""
+        raw = raw_name if raw_name else existing
+        item.setData(raw or "", self._name_raw_role)
+        item.setText(self.format_display_name(raw, ip))
 
     def on_device_clicked(self, index):
         if not index.isValid():
