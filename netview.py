@@ -7,6 +7,7 @@ import json
 import platform
 import queue
 import re
+import shutil
 import socket
 import subprocess
 import threading
@@ -772,6 +773,7 @@ class NetViewQt(QtWidgets.QMainWindow):
     status_retries_enable = QtCore.Signal(bool)
     status_refresh_enable = QtCore.Signal(bool)
     tasmota_row_update = QtCore.Signal(str, object)
+    prereq_row_update = QtCore.Signal(int, bool, str)
 
     def __init__(self):
         super().__init__()
@@ -804,6 +806,7 @@ class NetViewQt(QtWidgets.QMainWindow):
         self._tab_index_status = None
         self._tab_index_devices = None
         self._tab_index_tasmota = None
+        self._tab_index_prereq = None
 
         self.model = QtGui.QStandardItemModel(0, 6, self)
         self.model.setHorizontalHeaderLabels(
@@ -948,6 +951,25 @@ class NetViewQt(QtWidgets.QMainWindow):
         self._tab_index_devices = self.tabs.addTab(devices_tab, "Local Devices")
         self._tab_index_tasmota = self.tabs.addTab(tasmota_tab, "Tasmota Switches")
 
+        prereq_tab = QtWidgets.QWidget()
+        prereq_layout = QtWidgets.QVBoxLayout(prereq_tab)
+        prereq_layout.setContentsMargins(8, 8, 8, 8)
+        prereq_layout.setSpacing(10)
+
+        self.prereq_model = QtGui.QStandardItemModel(0, 3, self)
+        self.prereq_model.setHorizontalHeaderLabels(["Status", "Tool", "Path"])
+        self.prereq_view = QtWidgets.QTableView()
+        self.prereq_view.setModel(self.prereq_model)
+        self.prereq_view.horizontalHeader().setStretchLastSection(True)
+        self.prereq_view.verticalHeader().setVisible(False)
+        self.prereq_view.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.prereq_view.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.prereq_view.setShowGrid(False)
+        self.prereq_view.setAlternatingRowColors(True)
+        self.prereq_view.setWordWrap(False)
+        prereq_layout.addWidget(self.prereq_view)
+        self._tab_index_prereq = self.tabs.addTab(prereq_tab, "Prerequisites")
+
         base_font = QtGui.QFont()
         base_font.setPointSize(13)
         self.setFont(base_font)
@@ -955,10 +977,12 @@ class NetViewQt(QtWidgets.QMainWindow):
         self.view.setFont(base_font)
         self.status_view.setFont(base_font)
         self.tasmota_view.setFont(base_font)
+        self.prereq_view.setFont(base_font)
         self.mono_font = QtGui.QFont("Menlo", 12)
         self.view.verticalHeader().setDefaultSectionSize(28)
         self.ensure_device_column_widths()
         self.tasmota_view.verticalHeader().setDefaultSectionSize(28)
+        self.prereq_view.verticalHeader().setDefaultSectionSize(28)
 
         self.worker = ScanWorker()
         self.worker.upsert.connect(self.upsert_row)
@@ -981,10 +1005,12 @@ class NetViewQt(QtWidgets.QMainWindow):
         self._tasmota_updating = False
         self.tasmota_row_update.connect(self.update_tasmota_row)
         self.tasmota_model.itemChanged.connect(self.on_tasmota_item_changed)
+        self.prereq_row_update.connect(self.update_prereq_row)
         self.tasmota_timer = QtCore.QTimer(self)
         self.tasmota_timer.timeout.connect(self.on_tasmota_timer)
         self.devices_timer = QtCore.QTimer(self)
         self.devices_timer.timeout.connect(self.on_devices_timer)
+        self._prereq_rows = []
 
         # Allow quitting with Ctrl+C even when the app has focus.
         QtWidgets.QApplication.instance().installEventFilter(self)
@@ -994,6 +1020,7 @@ class NetViewQt(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(100, self.start_status_checks)
         QtCore.QTimer.singleShot(120, self.start_scan)
         QtCore.QTimer.singleShot(140, self.start_tasmota_scan)
+        QtCore.QTimer.singleShot(160, self.start_prereq_checks)
         QtCore.QTimer.singleShot(200, self.raise_)
         QtCore.QTimer.singleShot(250, self.activateWindow)
 
@@ -1116,6 +1143,8 @@ class NetViewQt(QtWidgets.QMainWindow):
             if not self._tasmota_rows:
                 self.start_tasmota_scan()
             self.apply_tasmota_auto_refresh()
+        elif index == self._tab_index_prereq:
+            self.start_prereq_checks()
 
     def start_status_checks(self):
         vprint("[netview] status: start")
@@ -1415,6 +1444,91 @@ class NetViewQt(QtWidgets.QMainWindow):
             return
         self.tasmota_timer.start(interval * 1000)
         self.refresh_tasmota()
+
+    def start_prereq_checks(self):
+        self.prereq_model.removeRows(0, self.prereq_model.rowCount())
+        tools = self.get_prereq_tools()
+        self._prereq_rows = tools
+        for tool in tools:
+            row = self.prereq_model.rowCount()
+            self.prereq_model.insertRow(row)
+            item = QtGui.QStandardItem("\U0001F501")
+            item.setForeground(QtGui.QBrush(QtGui.QColor("#6E6E73")))
+            self.prereq_model.setItem(row, 0, item)
+            self.prereq_model.setItem(row, 1, QtGui.QStandardItem(tool["label"]))
+            self.prereq_model.setItem(row, 2, QtGui.QStandardItem(tool.get("path", "")))
+        thread = threading.Thread(target=self.prereq_worker, daemon=True)
+        thread.start()
+
+    def prereq_worker(self):
+        tools = self._prereq_rows
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as exe:
+            future_map = {}
+            for idx, tool in enumerate(tools):
+                future_map[exe.submit(self.check_tool, tool)] = idx
+            for fut in concurrent.futures.as_completed(future_map):
+                idx = future_map[fut]
+                ok = safe_result(fut, default=False)
+                # Update path column after check
+                path = tools[idx].get("path", "")
+                self.prereq_row_update.emit(idx, ok, tools[idx]["label"])
+                if path:
+                    self.prereq_model.setItem(idx, 2, QtGui.QStandardItem(path))
+
+    def update_prereq_row(self, row, ok, _label):
+        status_icon = "✅" if ok else "❌"
+        item = QtGui.QStandardItem(status_icon)
+        item.setForeground(QtGui.QBrush(QtGui.QColor("#1E8E3E" if ok else "#D93025")))
+        self.prereq_model.setItem(row, 0, item)
+
+    def check_tool(self, tool):
+        path = shutil.which(tool["cmd"][0])
+        if not path:
+            vprint(f"[prereq] missing: {tool['cmd'][0]}")
+            return False
+        tool["path"] = path
+        try:
+            vprint(f"[prereq] run: {' '.join(tool['cmd'])}")
+            proc = subprocess.run(tool["cmd"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+            vprint(f"[prereq] {tool['cmd'][0]} -> exit {proc.returncode}")
+            return proc.returncode == 0
+        except Exception as e:
+            vprint(f"[prereq] {tool['cmd'][0]} -> exception: {e}")
+            return False
+
+    def get_prereq_tools(self):
+        system = platform.system().lower()
+        tools = []
+        if system == "darwin":
+            tools = [
+                {"label": "ping", "cmd": ["ping", "-c", "1", "127.0.0.1"]},
+                {"label": "arp", "cmd": ["arp", "-an"]},
+                {"label": "dscacheutil", "cmd": ["dscacheutil", "-q", "host", "-a", "ip_address", "127.0.0.1"]},
+                {"label": "scutil", "cmd": ["scutil", "--dns"]},
+                {"label": "route", "cmd": ["route", "-n", "get", "default"]},
+                {"label": "ipconfig", "cmd": ["ipconfig", "ifcount"]},
+                {"label": "traceroute", "cmd": ["traceroute", "-n", "-m", "1", "127.0.0.1"]},
+                {"label": "nslookup", "cmd": ["nslookup", "localhost"]},
+            ]
+        elif system == "linux":
+            tools = [
+                {"label": "ping", "cmd": ["ping", "-c", "1", "127.0.0.1"]},
+                {"label": "arp", "cmd": ["arp", "-a"]},
+                {"label": "getent", "cmd": ["getent", "hosts", "localhost"]},
+                {"label": "ip", "cmd": ["ip", "route", "show", "default"]},
+                {"label": "traceroute", "cmd": ["traceroute", "-n", "-m", "1", "127.0.0.1"]},
+                {"label": "nslookup", "cmd": ["nslookup", "localhost"]},
+            ]
+        else:
+            tools = [
+                {"label": "ping", "cmd": ["ping", "-n", "1", "127.0.0.1"]},
+                {"label": "arp", "cmd": ["arp", "-a"]},
+                {"label": "route", "cmd": ["route", "print", "0.0.0.0"]},
+                {"label": "ipconfig", "cmd": ["ipconfig", "/all"]},
+                {"label": "tracert", "cmd": ["tracert", "-h", "1", "127.0.0.1"]},
+                {"label": "nslookup", "cmd": ["nslookup", "localhost"]},
+            ]
+        return tools
 
     def update_tab_counts(self):
         if self._tab_index_devices is not None:
