@@ -34,21 +34,33 @@ def base_tab_name(text: str) -> str:
 def load_config():
     path = Path.home() / ".netviewrc.toml"
     if not path.exists():
+        vprint("[netview] config: missing")
         return {}
     try:
-        return tomllib.loads(path.read_text())
+        cfg = tomllib.loads(path.read_text())
+        vprint("[netview] config: loaded")
+        return cfg
     except Exception:
+        vprint("[netview] config: load failed")
         return {}
 
 
 def extract_known_hosts(cfg):
-    macs = cfg.get("known_hosts", {}).get("macs", [])
+    known = cfg.get("known_hosts", {})
+    macs = known.get("macs", [])
     out = set()
     for m in macs:
         m = str(m).strip().upper().replace(":", "").replace("-", "")
         if m:
             out.add(m)
-    return out
+    names = {}
+    for key, val in (known.get("names", {}) or {}).items():
+        k = str(key).strip().upper().replace(":", "").replace("-", "")
+        v = str(val).strip()
+        if k and v:
+            names[k] = v
+            out.add(k)
+    return out, names
 
 
 def write_config(cfg):
@@ -56,11 +68,19 @@ def write_config(cfg):
     lines = []
     # known hosts
     macs = sorted(cfg.get("known_hosts", {}).get("macs", []))
+    names = cfg.get("known_hosts", {}).get("names", {}) or {}
     lines.append("[known_hosts]")
     lines.append("macs = [")
     for m in macs:
         lines.append(f'  "{m}",')
     lines.append("]")
+    if names:
+        lines.append("")
+        lines.append("[known_hosts.names]")
+        for k in sorted(names.keys()):
+            key = json.dumps(str(k))
+            val = json.dumps(str(names.get(k, "")))
+            lines.append(f"{key} = {val}")
     lines.append("")
     # ui settings
     ui = cfg.get("ui", {})
@@ -74,7 +94,9 @@ def write_config(cfg):
     lines.append(f'ping_retries = "{ui.get("ping_retries", "5")}"')
     try:
         path.write_text("\n".join(lines) + "\n")
+        vprint("[netview] config: saved")
     except Exception:
+        vprint("[netview] config: save failed")
         pass
 
 
@@ -840,6 +862,7 @@ class NetViewQt(QtWidgets.QMainWindow):
 
     def __init__(self):
         super().__init__()
+        self._config = load_config()
         self.setWindowTitle("netview")
         self.resize(1300, 820)
 
@@ -889,7 +912,11 @@ class NetViewQt(QtWidgets.QMainWindow):
         self.view.horizontalHeader().setDefaultAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         self.view.verticalHeader().setVisible(False)
         self.view.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.view.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.view.setEditTriggers(
+            QtWidgets.QAbstractItemView.DoubleClicked
+            | QtWidgets.QAbstractItemView.EditKeyPressed
+            | QtWidgets.QAbstractItemView.SelectedClicked
+        )
         self.view.setShowGrid(False)
         self.view.setAlternatingRowColors(True)
         self.view.setWordWrap(False)
@@ -1085,10 +1112,13 @@ class NetViewQt(QtWidgets.QMainWindow):
         self.devices_timer = QtCore.QTimer(self)
         self.devices_timer.timeout.connect(self.on_devices_timer)
         self._prereq_rows = []
-        self._config = load_config()
-        self._known_macs = extract_known_hosts(self._config)
+        self._known_store_macs, self._known_store_names = extract_known_hosts(self._config)
+        vprint(f"[netview] known: loaded macs={len(self._known_store_macs)} names={len(self._known_store_names)}")
         self._known_updating = False
+        self._name_updating = False
+        self._name_programmatic = 0
         self.model.itemChanged.connect(self.on_known_item_changed)
+        self.model.itemChanged.connect(self.on_name_item_changed)
         self._config_timer = QtCore.QTimer(self)
         self._config_timer.setSingleShot(True)
         self._config_timer.timeout.connect(self.flush_config)
@@ -1150,11 +1180,13 @@ class NetViewQt(QtWidgets.QMainWindow):
                     item.setFont(self.mono_font)
                 if col == 5 and str(val).startswith("(") and str(val).endswith(")"):
                     item.setForeground(QtGui.QBrush(QtGui.QColor("#6E6E73")))
+                item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
                 self.model.setItem(row, col, item)
             else:
                 item.setText(str(val))
                 if col == 5 and str(val).startswith("(") and str(val).endswith(")"):
                     item.setForeground(QtGui.QBrush(QtGui.QColor("#6E6E73")))
+                item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
         self.set_name_item(row, ip, name)
         self.update_web_column(row)
         self.update_known_column(row, mac)
@@ -1203,6 +1235,7 @@ class NetViewQt(QtWidgets.QMainWindow):
                     self.model.setItem(row, 5, v_item)
         self.update_web_column(row)
         self.update_known_column(row, mac)
+        self.set_name_item(row, ip)
 
     def apply_name(self, ip, name):
         if not name:
@@ -1557,7 +1590,8 @@ class NetViewQt(QtWidgets.QMainWindow):
         ui["ping_timeout"] = self.status_timeout.currentText()
         ui["ping_retries"] = self.status_retries.currentText()
         self._config["ui"] = ui
-        self._config["known_hosts"] = {"macs": sorted(self._known_macs)}
+        names = {k: v for k, v in self._known_store_names.items() if v}
+        self._config["known_hosts"] = {"macs": sorted(self._known_store_macs), "names": names}
         write_config(self._config)
 
     def apply_saved_ui(self):
@@ -1712,9 +1746,8 @@ class NetViewQt(QtWidgets.QMainWindow):
             self.model.setItem(row, 2, item)
         item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsSelectable)
         self._known_updating = True
-        item.setCheckState(QtCore.Qt.Checked if raw in self._known_macs else QtCore.Qt.Unchecked)
+        item.setCheckState(QtCore.Qt.Checked if raw in self._known_store_macs else QtCore.Qt.Unchecked)
         self._known_updating = False
-
     def on_known_item_changed(self, item):
         if self._known_updating:
             return
@@ -1730,9 +1763,15 @@ class NetViewQt(QtWidgets.QMainWindow):
         if not raw:
             return
         if item.checkState() == QtCore.Qt.Checked:
-            self._known_macs.add(raw)
+            self._known_store_macs.add(raw)
+            vprint(f"[netview] known: add {raw}")
         else:
-            self._known_macs.discard(raw)
+            self._known_store_macs.discard(raw)
+            self._known_store_names.pop(raw, None)
+            vprint(f"[netview] known: remove {raw}")
+        ip_item = self.model.item(item.row(), 0)
+        ip = ip_item.text() if ip_item else ""
+        self.set_name_item(item.row(), ip)
         self.schedule_config_write()
 
     def name_suffixes_for_ip(self, ip):
@@ -1743,20 +1782,30 @@ class NetViewQt(QtWidgets.QMainWindow):
             suffixes.append("default gateway")
         return suffixes
 
-    def format_display_name(self, raw_name, ip):
+    def format_display_name(self, raw_name, ip, user_name):
         raw = (raw_name or "").strip()
-        if raw and not self.show_domain_box.isChecked():
+        display_raw = raw
+        if display_raw and not self.show_domain_box.isChecked():
             try:
-                ipaddress.ip_address(raw)
+                ipaddress.ip_address(display_raw)
             except ValueError:
-                if "." in raw:
-                    raw = raw.split(".", 1)[0]
+                if "." in display_raw:
+                    display_raw = display_raw.split(".", 1)[0]
+        base = ""
+        user = (user_name or "").strip()
+        if user:
+            if display_raw:
+                base = f"{user} ({display_raw})"
+            else:
+                base = user
+        else:
+            base = display_raw
         suffixes = self.name_suffixes_for_ip(ip)
         if not suffixes:
-            return raw
+            return base
         suffix = ", ".join(suffixes)
-        if raw:
-            return f"{raw} ({suffix})"
+        if base:
+            return f"{base} ({suffix})"
         return f"({suffix})"
 
     def set_name_item(self, row, ip, raw_name=None):
@@ -1766,8 +1815,22 @@ class NetViewQt(QtWidgets.QMainWindow):
             self.model.setItem(row, 3, item)
         existing = item.data(self._name_raw_role) or ""
         raw = raw_name if raw_name else existing
+        user_name = self.user_name_for_row(row, ip)
+        self._name_updating = True
+        self._name_programmatic += 1
         item.setData(raw or "", self._name_raw_role)
-        item.setText(self.format_display_name(raw, ip))
+        item.setData(user_name or "", QtCore.Qt.EditRole)
+        item.setText(self.format_display_name(raw, ip, user_name))
+        flags = item.flags() | QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled
+        mac_item = self.model.item(row, 4)
+        mac = mac_item.text() if mac_item else ""
+        if format_mac(mac):
+            flags |= QtCore.Qt.ItemIsEditable
+        else:
+            flags &= ~QtCore.Qt.ItemIsEditable
+        item.setFlags(flags)
+        QtCore.QTimer.singleShot(0, self._end_name_programmatic_update)
+        self._name_updating = False
 
     def on_show_domain_changed(self, _state):
         for row in range(self.model.rowCount()):
@@ -1775,6 +1838,45 @@ class NetViewQt(QtWidgets.QMainWindow):
             ip = ip_item.text() if ip_item else ""
             self.set_name_item(row, ip)
         self.schedule_config_write()
+
+    def user_name_for_row(self, row, ip):
+        mac_item = self.model.item(row, 4)
+        mac = mac_item.text() if mac_item else ""
+        raw_mac = format_mac(mac).replace(":", "").upper() if mac else ""
+        if raw_mac and raw_mac in self._known_store_names:
+            return self._known_store_names.get(raw_mac, "")
+        return ""
+
+    def on_name_item_changed(self, item):
+        if self._name_updating or self._name_programmatic > 0:
+            return
+        if item.column() != 3:
+            return
+        row = item.row()
+        ip_item = self.model.item(row, 0)
+        ip = ip_item.text() if ip_item else ""
+        user_name = item.data(QtCore.Qt.EditRole)
+        if user_name is None:
+            user_name = item.text()
+        user_name = str(user_name).strip()
+        mac_item = self.model.item(row, 4)
+        mac = mac_item.text() if mac_item else ""
+        raw_mac = format_mac(mac).replace(":", "").upper() if mac else ""
+        if raw_mac:
+            if user_name:
+                self._known_store_names[raw_mac] = user_name
+                self._known_store_macs.add(raw_mac)
+                vprint(f"[netview] known: name {raw_mac} -> {user_name}")
+            else:
+                self._known_store_names.pop(raw_mac, None)
+                vprint(f"[netview] known: name cleared {raw_mac}")
+            self.update_known_column(row, mac)
+            self.set_name_item(row, ip)
+        self.schedule_config_write()
+
+    def _end_name_programmatic_update(self):
+        if self._name_programmatic > 0:
+            self._name_programmatic -= 1
 
     def on_device_clicked(self, index):
         if not index.isValid():
