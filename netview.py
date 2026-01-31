@@ -27,15 +27,22 @@ def vprint(msg, level=1):
         print(msg, flush=True)
 
 
-def load_known_hosts():
+def base_tab_name(text: str) -> str:
+    return text.split(" (", 1)[0].strip()
+
+
+def load_config():
     path = Path.home() / ".netviewrc.toml"
     if not path.exists():
-        return set()
+        return {}
     try:
-        data = tomllib.loads(path.read_text())
+        return tomllib.loads(path.read_text())
     except Exception:
-        return set()
-    macs = data.get("known_hosts", {}).get("macs", [])
+        return {}
+
+
+def extract_known_hosts(cfg):
+    macs = cfg.get("known_hosts", {}).get("macs", [])
     out = set()
     for m in macs:
         m = str(m).strip().upper().replace(":", "").replace("-", "")
@@ -44,15 +51,28 @@ def load_known_hosts():
     return out
 
 
-def save_known_hosts(macs):
+def write_config(cfg):
     path = Path.home() / ".netviewrc.toml"
-    mac_list = sorted(macs)
-    content = ["[known_hosts]", "macs = ["]
-    for m in mac_list:
-        content.append(f'  "{m}",')
-    content.append("]")
+    lines = []
+    # known hosts
+    macs = sorted(cfg.get("known_hosts", {}).get("macs", []))
+    lines.append("[known_hosts]")
+    lines.append("macs = [")
+    for m in macs:
+        lines.append(f'  "{m}",')
+    lines.append("]")
+    lines.append("")
+    # ui settings
+    ui = cfg.get("ui", {})
+    lines.append("[ui]")
+    lines.append(f'tab = "{ui.get("tab", "Network Status")}"')
+    lines.append(f'status_auto = "{ui.get("status_auto", "Off")}"')
+    lines.append(f'devices_auto = "{ui.get("devices_auto", "Off")}"')
+    lines.append(f'tasmota_auto = "{ui.get("tasmota_auto", "Off")}"')
+    lines.append(f'ping_timeout = "{ui.get("ping_timeout", "200")}"')
+    lines.append(f'ping_retries = "{ui.get("ping_retries", "5")}"')
     try:
-        path.write_text("\n".join(content) + "\n")
+        path.write_text("\n".join(lines) + "\n")
     except Exception:
         pass
 
@@ -969,17 +989,17 @@ class NetViewQt(QtWidgets.QMainWindow):
 
         devices_bar = QtWidgets.QHBoxLayout()
         devices_bar.setSpacing(12)
-        self.scan_btn = QtWidgets.QPushButton("Refresh")
-        self.scan_btn.clicked.connect(self.start_scan)
+        self.refresh_btn = QtWidgets.QPushButton("Refresh")
+        self.refresh_btn.clicked.connect(self.start_scan)
         self.status = QtWidgets.QLabel("Idle")
         self.devices_refresh_box = QtWidgets.QComboBox()
         self.devices_refresh_box.addItems(["Off", "10s", "15s", "20s", "30s", "60s", "2m", "5m", "10m", "30m", "1h"])
         self.devices_refresh_box.setCurrentText("Off")
         self.devices_refresh_box.currentIndexChanged.connect(self.on_devices_refresh_changed)
-        devices_bar.addWidget(self.scan_btn)
-        devices_bar.addWidget(self.status)
+        devices_bar.addWidget(self.refresh_btn)
         devices_bar.addWidget(QtWidgets.QLabel("Auto-Refresh:"))
         devices_bar.addWidget(self.devices_refresh_box)
+        devices_bar.addWidget(self.status)
         devices_bar.addStretch(1)
         devices_layout.addLayout(devices_bar)
 
@@ -1048,9 +1068,13 @@ class NetViewQt(QtWidgets.QMainWindow):
         self.devices_timer = QtCore.QTimer(self)
         self.devices_timer.timeout.connect(self.on_devices_timer)
         self._prereq_rows = []
-        self._known_macs = load_known_hosts()
+        self._config = load_config()
+        self._known_macs = extract_known_hosts(self._config)
         self._known_updating = False
         self.model.itemChanged.connect(self.on_known_item_changed)
+        self._config_timer = QtCore.QTimer(self)
+        self._config_timer.setSingleShot(True)
+        self._config_timer.timeout.connect(self.flush_config)
 
         # Allow quitting with Ctrl+C even when the app has focus.
         QtWidgets.QApplication.instance().installEventFilter(self)
@@ -1063,6 +1087,7 @@ class NetViewQt(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(160, self.start_prereq_checks)
         QtCore.QTimer.singleShot(200, self.raise_)
         QtCore.QTimer.singleShot(250, self.activateWindow)
+        self.apply_saved_ui()
 
     def eventFilter(self, obj, event):
         if event.type() == QtCore.QEvent.KeyPress:
@@ -1072,7 +1097,7 @@ class NetViewQt(QtWidgets.QMainWindow):
         return super().eventFilter(obj, event)
 
     def start_scan(self):
-        self.scan_btn.setEnabled(False)
+        self.refresh_btn.setEnabled(False)
         self.status.setText("Scanning...")
         self.clear_table()
         self._scan_count = 0
@@ -1168,7 +1193,7 @@ class NetViewQt(QtWidgets.QMainWindow):
         self.update_web_column(row)
 
     def scan_finished(self, count):
-        self.scan_btn.setEnabled(True)
+        self.refresh_btn.setEnabled(True)
         self.status.setText(f"Done ({count} devices)")
         self.update_tab_counts()
 
@@ -1189,6 +1214,7 @@ class NetViewQt(QtWidgets.QMainWindow):
             self.apply_tasmota_auto_refresh()
         elif index == self._tab_index_prereq:
             self.start_prereq_checks()
+        self.schedule_config_write()
 
     def start_status_checks(self):
         vprint("[netview] status: start")
@@ -1443,6 +1469,7 @@ class NetViewQt(QtWidgets.QMainWindow):
     def on_tasmota_refresh_changed(self, _index):
         if self.tabs.currentIndex() == self._tab_index_tasmota:
             self.apply_tasmota_auto_refresh()
+        self.schedule_config_write()
 
     def on_tasmota_timer(self):
         if self.tabs.currentIndex() == self._tab_index_tasmota:
@@ -1455,6 +1482,7 @@ class NetViewQt(QtWidgets.QMainWindow):
     def on_devices_refresh_changed(self, _index):
         if self.tabs.currentIndex() == self._tab_index_devices:
             self.apply_devices_auto_refresh()
+        self.schedule_config_write()
 
     def apply_devices_auto_refresh(self):
         text = self.devices_refresh_box.currentText()
@@ -1472,6 +1500,7 @@ class NetViewQt(QtWidgets.QMainWindow):
             return
         self.devices_timer.start(interval * 1000)
         self.start_scan()
+        self.schedule_config_write()
 
     def apply_tasmota_auto_refresh(self):
         text = self.tasmota_refresh_box.currentText()
@@ -1489,6 +1518,41 @@ class NetViewQt(QtWidgets.QMainWindow):
             return
         self.tasmota_timer.start(interval * 1000)
         self.refresh_tasmota()
+        self.schedule_config_write()
+
+    def schedule_config_write(self):
+        self._config_timer.start(1000)
+
+    def flush_config(self):
+        ui = self._config.get("ui", {})
+        ui["tab"] = base_tab_name(self.tabs.tabText(self.tabs.currentIndex()))
+        ui["status_auto"] = self.status_refresh.currentText()
+        ui["devices_auto"] = self.devices_refresh_box.currentText()
+        ui["tasmota_auto"] = self.tasmota_refresh_box.currentText()
+        ui["ping_timeout"] = self.status_timeout.currentText()
+        ui["ping_retries"] = self.status_retries.currentText()
+        self._config["ui"] = ui
+        self._config["known_hosts"] = {"macs": sorted(self._known_macs)}
+        write_config(self._config)
+
+    def apply_saved_ui(self):
+        ui = self._config.get("ui", {})
+        if ui.get("status_auto"):
+            self.status_refresh.setCurrentText(ui.get("status_auto"))
+        if ui.get("devices_auto"):
+            self.devices_refresh_box.setCurrentText(ui.get("devices_auto"))
+        if ui.get("tasmota_auto"):
+            self.tasmota_refresh_box.setCurrentText(ui.get("tasmota_auto"))
+        if ui.get("ping_timeout"):
+            self.status_timeout.setCurrentText(ui.get("ping_timeout"))
+        if ui.get("ping_retries"):
+            self.status_retries.setCurrentText(ui.get("ping_retries"))
+        tab = ui.get("tab")
+        if tab:
+            for i in range(self.tabs.count()):
+                if base_tab_name(self.tabs.tabText(i)) == tab:
+                    self.tabs.setCurrentIndex(i)
+                    break
 
     def start_prereq_checks(self):
         self.prereq_model.removeRows(0, self.prereq_model.rowCount())
@@ -1636,7 +1700,7 @@ class NetViewQt(QtWidgets.QMainWindow):
             self._known_macs.add(raw)
         else:
             self._known_macs.discard(raw)
-        save_known_hosts(self._known_macs)
+        self.schedule_config_write()
 
     def on_device_clicked(self, index):
         if not index.isValid():
@@ -1872,14 +1936,17 @@ class NetViewQt(QtWidgets.QMainWindow):
     def on_timeout_changed(self, _index):
         if self.tabs.currentIndex() == self._tab_index_status:
             self.start_status_checks()
+        self.schedule_config_write()
 
     def on_retries_changed(self, _index):
         if self.tabs.currentIndex() == self._tab_index_status:
             self.start_status_checks()
+        self.schedule_config_write()
 
     def on_refresh_changed(self, _index):
         if self.tabs.currentIndex() == self._tab_index_status:
             self.apply_auto_refresh()
+        self.schedule_config_write()
 
     def on_status_timer(self):
         if self.tabs.currentIndex() == self._tab_index_status:
