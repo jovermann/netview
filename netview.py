@@ -892,6 +892,7 @@ class NetViewQt(QtWidgets.QMainWindow):
         self._oui_db = load_oui_db()
         self._rows = {}
         self._scan_count = 0
+        self._scan_running = False
         self._local_ip = None
         self._default_gateway = None
         self._name_raw_role = QtCore.Qt.UserRole + 1
@@ -1153,7 +1154,6 @@ class NetViewQt(QtWidgets.QMainWindow):
         self.tabs.currentChanged.connect(self.on_tab_changed)
         self._status_initialized = False
         QtCore.QTimer.singleShot(100, self.start_status_checks)
-        QtCore.QTimer.singleShot(120, self.start_scan)
         QtCore.QTimer.singleShot(140, self.start_tasmota_scan)
         QtCore.QTimer.singleShot(160, self.start_prereq_checks)
         QtCore.QTimer.singleShot(200, self.raise_)
@@ -1168,6 +1168,9 @@ class NetViewQt(QtWidgets.QMainWindow):
         return super().eventFilter(obj, event)
 
     def start_scan(self):
+        if self._scan_running:
+            return
+        self._scan_running = True
         self.refresh_btn.setEnabled(False)
         self.status.setText("Scanning...")
         self.clear_table()
@@ -1275,6 +1278,7 @@ class NetViewQt(QtWidgets.QMainWindow):
         self.update_web_column(row)
 
     def scan_finished(self, count):
+        self._scan_running = False
         self.refresh_btn.setEnabled(True)
         self.status.setText(f"Done ({count} devices)")
         self.update_tab_counts()
