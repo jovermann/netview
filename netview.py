@@ -792,8 +792,15 @@ class SortProxy(QtCore.QSortFilterProxyModel):
                 continue
             idx = model.index(source_row, col, source_parent)
             if known_col is not None and col == known_col:
-                state = model.data(idx, QtCore.Qt.CheckStateRole)
-                parts.append("known" if state == QtCore.Qt.Checked else "unknown")
+                state = model.data(idx, QtCore.Qt.UserRole)
+                if state is None:
+                    state = model.data(idx, QtCore.Qt.CheckStateRole)
+                    parts.append("known" if state == QtCore.Qt.Checked else "unknown")
+                else:
+                    try:
+                        parts.append("known" if int(state) == 1 else "unknown")
+                    except Exception:
+                        parts.append("unknown")
                 continue
             val = model.data(idx, QtCore.Qt.DisplayRole)
             if val is None:
