@@ -936,7 +936,7 @@ class NetViewQt(QtWidgets.QMainWindow):
     status_retries_enable = QtCore.Signal(bool)
     status_refresh_enable = QtCore.Signal(bool)
     tasmota_row_update = QtCore.Signal(str, object)
-    prereq_row_update = QtCore.Signal(int, bool, str)
+    prereq_row_update = QtCore.Signal(int, bool, str, str)
 
     def __init__(self):
         super().__init__()
@@ -1875,15 +1875,15 @@ class NetViewQt(QtWidgets.QMainWindow):
                 ok = safe_result(fut, default=False)
                 # Update path column after check
                 path = tools[idx].get("path", "")
-                self.prereq_row_update.emit(idx, ok, tools[idx]["label"])
-                if path:
-                    self.prereq_model.setItem(idx, 2, QtGui.QStandardItem(path))
+                self.prereq_row_update.emit(idx, ok, tools[idx]["label"], path)
 
-    def update_prereq_row(self, row, ok, _label):
+    def update_prereq_row(self, row, ok, _label, path):
         status_icon = "✅" if ok else "❌"
         item = QtGui.QStandardItem(status_icon)
         item.setForeground(QtGui.QBrush(QtGui.QColor("#1E8E3E" if ok else "#D93025")))
         self.prereq_model.setItem(row, 0, item)
+        if path:
+            self.prereq_model.setItem(row, 2, QtGui.QStandardItem(path))
 
     def check_tool(self, tool):
         path = shutil.which(tool["cmd"][0])
