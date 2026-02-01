@@ -16,6 +16,7 @@ import urllib.error
 from pathlib import Path
 import tomllib
 import sys
+import math
 
 from PySide6 import QtCore, QtGui, QtWidgets
 import PySide6
@@ -826,6 +827,103 @@ class SortProxy(QtCore.QSortFilterProxyModel):
         return self._search in haystack
 
 
+class WireCubeWidget(QtWidgets.QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._angle = 0.0
+        self._bg = QtGui.QColor("#FFFFFF")
+        self._line = QtGui.QColor("#6E6E73")
+        self._timer = QtCore.QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(30)
+
+    def set_colors(self, bg, line):
+        self._bg = QtGui.QColor(bg)
+        self._line = QtGui.QColor(line)
+        self.update()
+
+    def _tick(self):
+        self._angle = (self._angle + 1.5) % 360.0
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        painter.fillRect(self.rect(), self._bg)
+        w = max(1, self.width())
+        h = max(1, self.height())
+        size = min(w, h) * 0.175
+        cx = w * 0.5
+        cy = h * 0.5
+        angle = self._angle * math.pi / 180.0
+        ax = angle
+        ay = angle * 0.8
+        az = angle * 1.1
+        points = [
+            (-1, -1, -1),
+            (1, -1, -1),
+            (1, 1, -1),
+            (-1, 1, -1),
+            (-1, -1, 1),
+            (1, -1, 1),
+            (1, 1, 1),
+            (-1, 1, 1),
+        ]
+
+        def rotate(p):
+            x, y, z = p
+            cy = math.cos(ay)
+            sy = math.sin(ay)
+            cx = math.cos(ax)
+            sx = math.sin(ax)
+            cz = math.cos(az)
+            sz = math.sin(az)
+            x, z = x * cy + z * sy, -x * sy + z * cy
+            y, z = y * cx - z * sx, y * sx + z * cx
+            x, y = x * cz - y * sz, x * sz + y * cz
+            return x, y, z
+
+        def project(p):
+            x, y, z = p
+            d = 3.5
+            scale = d / (d - z)
+            return QtCore.QPointF(cx + x * size * scale, cy + y * size * scale)
+
+        rotated = [rotate(p) for p in points]
+        projected = [project(p) for p in rotated]
+        edges = [
+            (0, 1), (1, 2), (2, 3), (3, 0),
+            (4, 5), (5, 6), (6, 7), (7, 4),
+            (0, 4), (1, 5), (2, 6), (3, 7),
+        ]
+        pen = QtGui.QPen(self._line, 1.5)
+        painter.setPen(pen)
+        for a, b in edges:
+            if (rotated[a][2] + rotated[b][2]) / 2.0 < 0:
+                continue
+            painter.drawLine(projected[a], projected[b])
+
+
+class AboutBackdropWidget(QtWidgets.QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.cube = WireCubeWidget(self)
+        self.cube.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        self._layout = layout
+
+    def set_content(self, widget):
+        self._layout.addWidget(widget)
+        self.cube.lower()
+        widget.raise_()
+
+    def resizeEvent(self, event):
+        self.cube.setGeometry(self.rect())
+        return super().resizeEvent(event)
+
+
 class ScanWorker(QtCore.QObject):
     upsert = QtCore.Signal(str, str, str, str)
     merge_identity = QtCore.Signal(str, str, str)
@@ -1263,6 +1361,8 @@ class NetViewQt(QtWidgets.QMainWindow):
             f"Python: {py_version}<br>"
             f"PySide: {pyside_version}<br>"
         )
+        about_container = AboutBackdropWidget()
+        self.about_cube = about_container.cube
         self.about_info = QtWidgets.QLabel()
         self.about_info.setTextFormat(QtCore.Qt.RichText)
         self.about_info.setTextInteractionFlags(QtCore.Qt.TextBrowserInteraction)
@@ -1271,7 +1371,10 @@ class NetViewQt(QtWidgets.QMainWindow):
         self.about_info.setWordWrap(True)
         self.about_info.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
         self.about_info.setMargin(8)
-        about_info_layout.addWidget(self.about_info)
+        self.about_info.setAutoFillBackground(False)
+        self.about_info.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        about_container.set_content(self.about_info)
+        about_info_layout.addWidget(about_container)
         self.about_tabs.addTab(about_info_tab, "About netview")
 
         license_tab = QtWidgets.QWidget()
@@ -1301,7 +1404,8 @@ class NetViewQt(QtWidgets.QMainWindow):
         license_palette = self.license_text.palette()
         bg = license_palette.color(QtGui.QPalette.Base).name()
         fg = license_palette.color(QtGui.QPalette.Text).name()
-        self.about_info.setStyleSheet(f"background-color: {bg}; color: {fg};")
+        self.about_cube.set_colors(bg, fg)
+        self.about_info.setStyleSheet(f"background-color: rgba(0, 0, 0, 0); color: {fg};")
 
         self._tab_index_about = self.tabs.addTab(about_tab, "About")
 
