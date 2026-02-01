@@ -1202,6 +1202,7 @@ class NetViewQt(QtWidgets.QMainWindow):
         # Allow quitting with Ctrl+C even when the app has focus.
         QtWidgets.QApplication.instance().installEventFilter(self)
 
+        self._startup_scan_scheduled = False
         self.tabs.currentChanged.connect(self.on_tab_changed)
         self._status_initialized = False
         QtCore.QTimer.singleShot(100, self.start_status_checks)
@@ -1210,6 +1211,7 @@ class NetViewQt(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(200, self.raise_)
         QtCore.QTimer.singleShot(250, self.activateWindow)
         self.apply_saved_ui()
+        QtCore.QTimer.singleShot(0, self.schedule_initial_scan)
         self.refresh_known_devices_table()
 
     def eventFilter(self, obj, event):
@@ -1353,6 +1355,18 @@ class NetViewQt(QtWidgets.QMainWindow):
         elif index == self._tab_index_prereq:
             self.start_prereq_checks()
         self.schedule_config_write()
+
+    def schedule_initial_scan(self):
+        if self._startup_scan_scheduled:
+            return
+        self._startup_scan_scheduled = True
+        if self._tab_index_devices is None:
+            return
+        current = self.tabs.currentIndex()
+        if current == self._tab_index_devices:
+            self.start_scan()
+            return
+        self.start_scan()
 
     def start_status_checks(self):
         vprint("[netview] status: start")
