@@ -118,6 +118,8 @@ def write_config(cfg):
     lines.append(f'tasmota_sort_order = "{ui.get("tasmota_sort_order", "asc")}"')
     lines.append(f'prereq_sort_col = "{ui.get("prereq_sort_col", "0")}"')
     lines.append(f'prereq_sort_order = "{ui.get("prereq_sort_order", "asc")}"')
+    lines.append(f'known_sort_col = "{ui.get("known_sort_col", "0")}"')
+    lines.append(f'known_sort_order = "{ui.get("known_sort_order", "asc")}"')
     lines.append(f'ping_timeout = "{ui.get("ping_timeout", "200")}"')
     lines.append(f'ping_retries = "{ui.get("ping_retries", "5")}"')
     try:
@@ -926,6 +928,7 @@ class NetViewQt(QtWidgets.QMainWindow):
         layout.addWidget(self.tabs)
         self._tab_index_status = None
         self._tab_index_devices = None
+        self._tab_index_known = None
         self._tab_index_tasmota = None
         self._tab_index_prereq = None
 
@@ -1084,6 +1087,35 @@ class NetViewQt(QtWidgets.QMainWindow):
         devices_layout.addWidget(self.view)
 
         self._tab_index_devices = self.tabs.addTab(devices_tab, "Local Devices")
+
+        known_tab = QtWidgets.QWidget()
+        known_layout = QtWidgets.QVBoxLayout(known_tab)
+        known_layout.setContentsMargins(8, 8, 8, 8)
+        known_layout.setSpacing(10)
+
+        self.known_model = QtGui.QStandardItemModel(0, 6, self)
+        self.known_model.setHorizontalHeaderLabels(
+            ["Del", "IP", "User Name", "DNS", "MAC", "Vendor"]
+        )
+        self.known_view = QtWidgets.QTableView()
+        self.known_view.setModel(self.known_model)
+        self.known_view.setSortingEnabled(True)
+        self.known_view.horizontalHeader().setStretchLastSection(True)
+        self.known_view.verticalHeader().setVisible(False)
+        self.known_view.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.known_view.setEditTriggers(
+            QtWidgets.QAbstractItemView.DoubleClicked
+            | QtWidgets.QAbstractItemView.EditKeyPressed
+            | QtWidgets.QAbstractItemView.SelectedClicked
+        )
+        self.known_view.setShowGrid(False)
+        self.known_view.setAlternatingRowColors(True)
+        self.known_view.setWordWrap(False)
+        self.known_view.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.known_view.customContextMenuRequested.connect(self.show_table_context_menu)
+        self.known_view.clicked.connect(self.on_known_devices_clicked)
+        known_layout.addWidget(self.known_view)
+        self._tab_index_known = self.tabs.addTab(known_tab, "Known Devices")
         self._tab_index_tasmota = self.tabs.addTab(tasmota_tab, "Tasmota Switches")
 
         prereq_tab = QtWidgets.QWidget()
@@ -1114,6 +1146,7 @@ class NetViewQt(QtWidgets.QMainWindow):
         self.status_view.setFont(base_font)
         self.tasmota_view.setFont(base_font)
         self.prereq_view.setFont(base_font)
+        self.known_view.setFont(base_font)
         self.mono_font = QtGui.QFont("Menlo", 12)
         self.view.verticalHeader().setDefaultSectionSize(28)
         self.ensure_device_column_widths()
@@ -1123,6 +1156,7 @@ class NetViewQt(QtWidgets.QMainWindow):
         self.status_view.horizontalHeader().sortIndicatorChanged.connect(self.on_table_sort_changed)
         self.tasmota_view.horizontalHeader().sortIndicatorChanged.connect(self.on_table_sort_changed)
         self.prereq_view.horizontalHeader().sortIndicatorChanged.connect(self.on_table_sort_changed)
+        self.known_view.horizontalHeader().sortIndicatorChanged.connect(self.on_table_sort_changed)
 
         self.worker = ScanWorker()
         self.worker.upsert.connect(self.upsert_row)
@@ -1157,8 +1191,10 @@ class NetViewQt(QtWidgets.QMainWindow):
         self._name_updating = False
         self._known_programmatic = 0
         self._name_programmatic = 0
+        self._known_devices_updating = False
         self.model.itemChanged.connect(self.on_known_item_changed)
         self.model.itemChanged.connect(self.on_name_item_changed)
+        self.known_model.itemChanged.connect(self.on_known_devices_item_changed)
         self._config_timer = QtCore.QTimer(self)
         self._config_timer.setSingleShot(True)
         self._config_timer.timeout.connect(self.flush_config)
@@ -1174,6 +1210,7 @@ class NetViewQt(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(200, self.raise_)
         QtCore.QTimer.singleShot(250, self.activateWindow)
         self.apply_saved_ui()
+        self.refresh_known_devices_table()
 
     def eventFilter(self, obj, event):
         if event.type() == QtCore.QEvent.KeyPress:
@@ -1643,6 +1680,9 @@ class NetViewQt(QtWidgets.QMainWindow):
         p_header = self.prereq_view.horizontalHeader()
         ui["prereq_sort_col"] = str(p_header.sortIndicatorSection())
         ui["prereq_sort_order"] = "desc" if p_header.sortIndicatorOrder() == QtCore.Qt.DescendingOrder else "asc"
+        k_header = self.known_view.horizontalHeader()
+        ui["known_sort_col"] = str(k_header.sortIndicatorSection())
+        ui["known_sort_order"] = "desc" if k_header.sortIndicatorOrder() == QtCore.Qt.DescendingOrder else "asc"
         ui["ping_timeout"] = self.status_timeout.currentText()
         ui["ping_retries"] = self.status_retries.currentText()
         self._config["ui"] = ui
@@ -1702,6 +1742,7 @@ class NetViewQt(QtWidgets.QMainWindow):
         self.apply_table_sort(self.status_view, ui.get("status_sort_col"), ui.get("status_sort_order"))
         self.apply_table_sort(self.tasmota_view, ui.get("tasmota_sort_col"), ui.get("tasmota_sort_order"))
         self.apply_table_sort(self.prereq_view, ui.get("prereq_sort_col"), ui.get("prereq_sort_order"))
+        self.apply_table_sort(self.known_view, ui.get("known_sort_col"), ui.get("known_sort_order"))
         tab = ui.get("tab")
         if tab:
             for i in range(self.tabs.count()):
@@ -1797,6 +1838,8 @@ class NetViewQt(QtWidgets.QMainWindow):
     def update_tab_counts(self):
         if self._tab_index_devices is not None:
             self.tabs.setTabText(self._tab_index_devices, f"Local Devices ({len(self._rows)})")
+        if self._tab_index_known is not None:
+            self.tabs.setTabText(self._tab_index_known, f"Known Devices ({len(self._known_store_macs)})")
         if self._tab_index_tasmota is not None:
             self.tabs.setTabText(self._tab_index_tasmota, f"Tasmota Switches ({len(self._tasmota_rows)})")
 
@@ -1869,6 +1912,8 @@ class NetViewQt(QtWidgets.QMainWindow):
         ip_item = self.model.item(item.row(), 0)
         ip = ip_item.text() if ip_item else ""
         self.set_name_item(item.row(), ip)
+        self.refresh_known_devices_table()
+        self.update_tab_counts()
         self.schedule_config_write()
 
     def _end_known_programmatic_update(self):
@@ -1953,6 +1998,92 @@ class NetViewQt(QtWidgets.QMainWindow):
         ord_val = QtCore.Qt.DescendingOrder if str(order).lower() == "desc" else QtCore.Qt.AscendingOrder
         view.sortByColumn(col_idx, ord_val)
 
+    def refresh_known_devices_table(self):
+        self._known_devices_updating = True
+        self.known_model.removeRows(0, self.known_model.rowCount())
+        known = self._config.get("known_hosts", {}) or {}
+        for mac in sorted(self._known_store_macs):
+            entry = known.get(mac, ["", "", "", ""])
+            if not isinstance(entry, (list, tuple)):
+                entry = ["", "", "", ""]
+            entry = [str(v) for v in list(entry)[:4]]
+            while len(entry) < 4:
+                entry.append("")
+            user_name = self._known_store_names.get(mac, entry[0])
+            dns_name = entry[1]
+            ip_addr = entry[2]
+            vendor = entry[3]
+            row = self.known_model.rowCount()
+            self.known_model.insertRow(row)
+            values = ["\U0001F5D1\uFE0F", ip_addr, user_name, dns_name, format_mac(mac), vendor]
+            for col, val in enumerate(values):
+                item = QtGui.QStandardItem(str(val))
+                if col == 4:
+                    item.setFont(self.mono_font)
+                if col == 0:
+                    item.setTextAlignment(QtCore.Qt.AlignCenter)
+                if col == 2:
+                    item.setFlags(item.flags() | QtCore.Qt.ItemIsEditable)
+                else:
+                    item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
+                item.setData(mac, QtCore.Qt.UserRole)
+                self.known_model.setItem(row, col, item)
+        self.known_view.resizeColumnsToContents()
+        header = self.known_view.horizontalHeader()
+        header.setStretchLastSection(True)
+        self.known_view.setColumnWidth(0, 36)
+        self.known_view.sortByColumn(header.sortIndicatorSection(), header.sortIndicatorOrder())
+        self._known_devices_updating = False
+        self.update_tab_counts()
+
+    def on_known_devices_item_changed(self, item):
+        if self._known_devices_updating:
+            return
+        if item.column() != 2:
+            return
+        mac = item.data(QtCore.Qt.UserRole) or ""
+        mac = str(mac).strip().upper().replace(":", "").replace("-", "")
+        if not mac:
+            return
+        name = (item.text() or "").strip()
+        if name:
+            self._known_store_names[mac] = name
+            self._known_store_macs.add(mac)
+            vprint(f"[netview] known: name {mac} -> {name}")
+        else:
+            self._known_store_names.pop(mac, None)
+            vprint(f"[netview] known: name cleared {mac}")
+        for ip, row in self._rows.items():
+            mac_item = self.model.item(row, 4)
+            if not mac_item:
+                continue
+            if format_mac(mac_item.text()).replace(":", "").upper() == mac:
+                self.set_name_item(row, ip)
+        self.schedule_config_write()
+
+    def on_known_devices_clicked(self, index):
+        if not index.isValid():
+            return
+        if index.column() != 0:
+            return
+        item = self.known_model.item(index.row(), 0)
+        mac = item.data(QtCore.Qt.UserRole) if item else ""
+        mac = str(mac).strip().upper().replace(":", "").replace("-", "")
+        if not mac:
+            return
+        self._known_store_macs.discard(mac)
+        self._known_store_names.pop(mac, None)
+        vprint(f"[netview] known: remove {mac}")
+        self.refresh_known_devices_table()
+        for ip, row in self._rows.items():
+            mac_item = self.model.item(row, 4)
+            if not mac_item:
+                continue
+            if format_mac(mac_item.text()).replace(":", "").upper() == mac:
+                self.update_known_column(row, mac_item.text())
+                self.set_name_item(row, ip)
+        self.schedule_config_write()
+
     def user_name_for_row(self, row, ip):
         mac_item = self.model.item(row, 4)
         mac = mac_item.text() if mac_item else ""
@@ -1986,6 +2117,8 @@ class NetViewQt(QtWidgets.QMainWindow):
                 vprint(f"[netview] known: name cleared {raw_mac}")
             self.update_known_column(row, mac)
             self.set_name_item(row, ip)
+            self.refresh_known_devices_table()
+            self.update_tab_counts()
         self.schedule_config_write()
 
     def _end_name_programmatic_update(self):
