@@ -1235,6 +1235,10 @@ class NetViewQt(QtWidgets.QMainWindow):
         self.prereq_view.setShowGrid(False)
         self.prereq_view.setAlternatingRowColors(True)
         self.prereq_view.setWordWrap(False)
+        prereq_header = self.prereq_view.horizontalHeader()
+        prereq_header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        prereq_header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+        prereq_header.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
         prereq_layout.addWidget(self.prereq_view)
         self._tab_index_prereq = self.tabs.addTab(prereq_tab, "Prerequisites")
 
