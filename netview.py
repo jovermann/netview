@@ -15,9 +15,13 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 import tomllib
+import sys
 
 from PySide6 import QtCore, QtGui, QtWidgets
+import PySide6
 import signal
+
+NETVIEW_VERSION = "0.5.3"
 
 VERBOSE = 0
 
@@ -951,7 +955,7 @@ class NetViewQt(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self._config = load_config()
-        self.setWindowTitle("netview")
+        self.setWindowTitle(f"netview {NETVIEW_VERSION}")
         self.resize(1300, 820)
 
         self._oui_db = load_oui_db()
@@ -984,7 +988,7 @@ class NetViewQt(QtWidgets.QMainWindow):
         self._tab_index_status = None
         self._tab_index_devices = None
         self._tab_index_known = None
-        self._tab_index_license = None
+        self._tab_index_about = None
         self._tab_index_tasmota = None
         self._tab_index_prereq = None
 
@@ -1234,6 +1238,38 @@ class NetViewQt(QtWidgets.QMainWindow):
         prereq_layout.addWidget(self.prereq_view)
         self._tab_index_prereq = self.tabs.addTab(prereq_tab, "Prerequisites")
 
+        about_tab = QtWidgets.QWidget()
+        about_layout = QtWidgets.QVBoxLayout(about_tab)
+        about_layout.setContentsMargins(8, 8, 8, 8)
+        about_layout.setSpacing(10)
+        self.about_tabs = QtWidgets.QTabWidget()
+        about_layout.addWidget(self.about_tabs)
+
+        about_info_tab = QtWidgets.QWidget()
+        about_info_layout = QtWidgets.QVBoxLayout(about_info_tab)
+        about_info_layout.setContentsMargins(8, 8, 8, 8)
+        about_info_layout.setSpacing(10)
+        py_version = sys.version.split()[0]
+        pyside_version = getattr(PySide6, "__version__", "unknown")
+        netview_version = NETVIEW_VERSION
+        about_text = (
+            f"netview version {NETVIEW_VERSION}<br>"
+            "Copyright (c) 2026 Johannes Overmann<br>"
+            "<a href=\"https://github.com/jovermann/netview\">https://github.com/jovermann/netview</a><br><br><br>"
+            f"Python: {py_version}<br>"
+            f"PySide: {pyside_version}<br>"
+        )
+        self.about_info = QtWidgets.QLabel()
+        self.about_info.setTextFormat(QtCore.Qt.RichText)
+        self.about_info.setTextInteractionFlags(QtCore.Qt.TextBrowserInteraction)
+        self.about_info.setOpenExternalLinks(True)
+        self.about_info.setText(about_text)
+        self.about_info.setWordWrap(True)
+        self.about_info.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+        self.about_info.setMargin(8)
+        about_info_layout.addWidget(self.about_info)
+        self.about_tabs.addTab(about_info_tab, "About netview")
+
         license_tab = QtWidgets.QWidget()
         license_layout = QtWidgets.QVBoxLayout(license_tab)
         license_layout.setContentsMargins(8, 8, 8, 8)
@@ -1257,7 +1293,13 @@ class NetViewQt(QtWidgets.QMainWindow):
         )
         self.license_text.setPlainText(license_text)
         license_layout.addWidget(self.license_text)
-        self._tab_index_license = self.tabs.addTab(license_tab, "License")
+        self.about_tabs.addTab(license_tab, "License and Disclaimer")
+        license_palette = self.license_text.palette()
+        bg = license_palette.color(QtGui.QPalette.Base).name()
+        fg = license_palette.color(QtGui.QPalette.Text).name()
+        self.about_info.setStyleSheet(f"background-color: {bg}; color: {fg};")
+
+        self._tab_index_about = self.tabs.addTab(about_tab, "About")
 
         base_font = QtGui.QFont()
         base_font.setPointSize(13)
@@ -1269,6 +1311,7 @@ class NetViewQt(QtWidgets.QMainWindow):
         self.prereq_view.setFont(base_font)
         self.known_view.setFont(base_font)
         self.license_text.setFont(base_font)
+        self.about_info.setFont(base_font)
         self.mono_font = QtGui.QFont("Menlo", 12)
         self.view.verticalHeader().setDefaultSectionSize(28)
         self.ensure_device_column_widths()
@@ -2613,7 +2656,8 @@ class NetViewQt(QtWidgets.QMainWindow):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="netview network scanner")
+    parser = argparse.ArgumentParser(description=f"netview {NETVIEW_VERSION} network scanner")
+    parser.add_argument("-V", "--version", action="version", version=f"netview {NETVIEW_VERSION}")
     parser.add_argument("-v", "--verbose", action="count", default=0, help="increase verbosity")
     args = parser.parse_args()
     global VERBOSE
