@@ -733,6 +733,14 @@ def safe_result(fut, default=None):
 
 
 class SortProxy(QtCore.QSortFilterProxyModel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._search = ""
+
+    def set_search(self, text):
+        self._search = (text or "").strip().lower()
+        self.invalidate()
+
     def lessThan(self, left, right):
         col = left.column()
         lval = left.data()
@@ -765,6 +773,28 @@ class SortProxy(QtCore.QSortFilterProxyModel):
         if col == 6:
             return ports_key(lval) < ports_key(rval)
         return str(lval).lower() < str(rval).lower()
+
+    def filterAcceptsRow(self, source_row, source_parent):
+        if not self._search:
+            return True
+        model = self.sourceModel()
+        parts = []
+        for col in range(model.columnCount()):
+            if col == 1:
+                continue
+            idx = model.index(source_row, col, source_parent)
+            if col == 2:
+                state = model.data(idx, QtCore.Qt.CheckStateRole)
+                parts.append("known" if state == QtCore.Qt.Checked else "unknown")
+                continue
+            val = model.data(idx, QtCore.Qt.DisplayRole)
+            if val is None:
+                continue
+            text = str(val).strip()
+            if text:
+                parts.append(text)
+        haystack = " ".join(parts).lower()
+        return self._search in haystack
 
 
 class ScanWorker(QtCore.QObject):
@@ -1072,6 +1102,9 @@ class NetViewQt(QtWidgets.QMainWindow):
         self.show_domain_box = QtWidgets.QCheckBox("Show domain")
         self.show_domain_box.setChecked(False)
         self.show_domain_box.stateChanged.connect(self.on_show_domain_changed)
+        self.search_box = QtWidgets.QLineEdit()
+        self.search_box.setPlaceholderText("Filter devices...")
+        self.search_box.textChanged.connect(self.on_device_search_changed)
         self.devices_refresh_box = QtWidgets.QComboBox()
         self.devices_refresh_box.addItems(["Off", "10s", "15s", "20s", "30s", "60s", "2m", "5m", "10m", "30m", "1h"])
         self.devices_refresh_box.setCurrentText("Off")
@@ -1080,6 +1113,7 @@ class NetViewQt(QtWidgets.QMainWindow):
         devices_bar.addWidget(QtWidgets.QLabel("Auto-Refresh:"))
         devices_bar.addWidget(self.devices_refresh_box)
         devices_bar.addWidget(self.show_domain_box)
+        devices_bar.addWidget(self.search_box)
         devices_bar.addWidget(self.status)
         devices_bar.addStretch(1)
         devices_layout.addLayout(devices_bar)
@@ -1998,6 +2032,9 @@ class NetViewQt(QtWidgets.QMainWindow):
             ip = ip_item.text() if ip_item else ""
             self.set_name_item(row, ip)
         self.schedule_config_write()
+
+    def on_device_search_changed(self, text):
+        self.proxy.set_search(text)
 
     def on_table_sort_changed(self, _section, _order):
         self.schedule_config_write()
