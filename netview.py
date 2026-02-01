@@ -30,6 +30,15 @@ def vprint(msg, level=1):
 def base_tab_name(text: str) -> str:
     return text.split(" (", 1)[0].strip()
 
+def disclaimer_bullets_text():
+    return (
+        "• You are authorized to scan the local network. This is usually only the case for your own private network.\n"
+        "• You are authorized to issue post scans on all devices on the local network.\n"
+        "• You are aware that external servers like DNS servers and web servers are contacted and that such accesses leave traces like the IP address and time of access on these servers.\n"
+        "• You understand the risks from switching remote sockets.\n"
+        "Use this tool at your own risk."
+    )
+
 
 def load_config():
     path = Path.home() / ".netviewrc.toml"
@@ -120,6 +129,7 @@ def write_config(cfg):
     lines.append(f'prereq_sort_order = "{ui.get("prereq_sort_order", "asc")}"')
     lines.append(f'known_sort_col = "{ui.get("known_sort_col", "0")}"')
     lines.append(f'known_sort_order = "{ui.get("known_sort_order", "asc")}"')
+    lines.append(f'disclaimer_ok = "{ui.get("disclaimer_ok", "Off")}"')
     lines.append(f'ping_timeout = "{ui.get("ping_timeout", "200")}"')
     lines.append(f'ping_retries = "{ui.get("ping_retries", "5")}"')
     try:
@@ -974,6 +984,7 @@ class NetViewQt(QtWidgets.QMainWindow):
         self._tab_index_status = None
         self._tab_index_devices = None
         self._tab_index_known = None
+        self._tab_index_license = None
         self._tab_index_tasmota = None
         self._tab_index_prereq = None
 
@@ -1223,6 +1234,31 @@ class NetViewQt(QtWidgets.QMainWindow):
         prereq_layout.addWidget(self.prereq_view)
         self._tab_index_prereq = self.tabs.addTab(prereq_tab, "Prerequisites")
 
+        license_tab = QtWidgets.QWidget()
+        license_layout = QtWidgets.QVBoxLayout(license_tab)
+        license_layout.setContentsMargins(8, 8, 8, 8)
+        license_layout.setSpacing(10)
+        license_bar = QtWidgets.QHBoxLayout()
+        self.license_show_disclaimer = QtWidgets.QPushButton("Show Confirmation Dialog")
+        self.license_show_disclaimer.clicked.connect(self.on_show_disclaimer_clicked)
+        license_bar.addWidget(self.license_show_disclaimer)
+        license_bar.addStretch(1)
+        license_layout.addLayout(license_bar)
+        self.license_text = QtWidgets.QPlainTextEdit()
+        self.license_text.setReadOnly(True)
+        try:
+            license_body = (Path(__file__).parent / "LICENSE").read_text()
+        except Exception:
+            license_body = "LICENSE file not found."
+        license_text = (
+            f"{license_body}\n\n"
+            "By using this software you confirm:\n"
+            f"{disclaimer_bullets_text()}\n"
+        )
+        self.license_text.setPlainText(license_text)
+        license_layout.addWidget(self.license_text)
+        self._tab_index_license = self.tabs.addTab(license_tab, "License")
+
         base_font = QtGui.QFont()
         base_font.setPointSize(13)
         self.setFont(base_font)
@@ -1232,6 +1268,7 @@ class NetViewQt(QtWidgets.QMainWindow):
         self.tasmota_view.setFont(base_font)
         self.prereq_view.setFont(base_font)
         self.known_view.setFont(base_font)
+        self.license_text.setFont(base_font)
         self.mono_font = QtGui.QFont("Menlo", 12)
         self.view.verticalHeader().setDefaultSectionSize(28)
         self.ensure_device_column_widths()
@@ -1277,6 +1314,9 @@ class NetViewQt(QtWidgets.QMainWindow):
         self._known_programmatic = 0
         self._name_programmatic = 0
         self._known_devices_updating = False
+        ui_cfg = self._config.get("ui", {})
+        self._disclaimer_state = "accepted" if ui_cfg.get("disclaimer_ok") == "On" else "pending"
+        self._disclaimer_shown = False
         self.model.itemChanged.connect(self.on_known_item_changed)
         self.model.itemChanged.connect(self.on_name_item_changed)
         self.known_model.itemChanged.connect(self.on_known_devices_item_changed)
@@ -1290,13 +1330,10 @@ class NetViewQt(QtWidgets.QMainWindow):
         self._startup_scan_scheduled = False
         self.tabs.currentChanged.connect(self.on_tab_changed)
         self._status_initialized = False
-        QtCore.QTimer.singleShot(100, self.start_status_checks)
-        QtCore.QTimer.singleShot(140, self.start_tasmota_scan)
-        QtCore.QTimer.singleShot(160, self.start_prereq_checks)
         QtCore.QTimer.singleShot(200, self.raise_)
         QtCore.QTimer.singleShot(250, self.activateWindow)
         self.apply_saved_ui()
-        QtCore.QTimer.singleShot(0, self.schedule_initial_scan)
+        QtCore.QTimer.singleShot(300, self.startup_tasks_with_disclaimer)
         self.refresh_known_devices_table()
 
     def eventFilter(self, obj, event):
@@ -1307,6 +1344,8 @@ class NetViewQt(QtWidgets.QMainWindow):
         return super().eventFilter(obj, event)
 
     def start_scan(self):
+        if not self.ensure_disclaimer():
+            return
         if self._scan_running:
             return
         self._scan_running = True
@@ -1453,7 +1492,58 @@ class NetViewQt(QtWidgets.QMainWindow):
             return
         self.start_scan()
 
+    def startup_tasks(self):
+        self.start_status_checks()
+        self.start_tasmota_scan()
+        self.start_prereq_checks()
+        self.schedule_initial_scan()
+
+    def ensure_disclaimer(self):
+        return self._disclaimer_state == "accepted"
+
+    def startup_tasks_with_disclaimer(self):
+        if self._disclaimer_state == "accepted":
+            self.startup_tasks()
+            return
+        if self._disclaimer_state == "declined" or self._disclaimer_shown:
+            return
+        self._disclaimer_shown = True
+        dlg = QtWidgets.QMessageBox(self)
+        dlg.setWindowTitle("Netview Disclaimer")
+        dlg.setIcon(QtWidgets.QMessageBox.Warning)
+        dlg.setText(
+            "Disclaimer\n\n"
+            "By proceeding, you confirm:\n"
+            f"{disclaimer_bullets_text()}\n\n"
+            "THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\n"
+            "IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\n"
+            "FITNESS FOR A PARTICULAR PURPOSE, TITLE AND NON-INFRINGEMENT. IN NO EVENT\n"
+            "SHALL THE COPYRIGHT HOLDERS OR ANYONE DISTRIBUTING THE SOFTWARE BE LIABLE\n"
+            "FOR ANY DAMAGES OR OTHER LIABILITY, WHETHER IN CONTRACT, TORT OR OTHERWISE,\n"
+            "ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER\n"
+            "DEALINGS IN THE SOFTWARE."
+        )
+        dlg.setStandardButtons(QtWidgets.QMessageBox.Ok | QtWidgets.QMessageBox.Close)
+        dlg.button(QtWidgets.QMessageBox.Ok).setText("OK")
+        dlg.button(QtWidgets.QMessageBox.Close).setText("Quit")
+        checkbox = QtWidgets.QCheckBox("Do not ask this again")
+        dlg.setCheckBox(checkbox)
+        result = dlg.exec()
+        if result == QtWidgets.QMessageBox.Ok:
+            self._disclaimer_state = "accepted"
+            if checkbox.isChecked():
+                ui = self._config.get("ui", {})
+                ui["disclaimer_ok"] = "On"
+                self._config["ui"] = ui
+                write_config(self._config)
+            self.startup_tasks()
+            return
+        self._disclaimer_state = "declined"
+        QtWidgets.QApplication.quit()
+
     def start_status_checks(self):
+        if not self.ensure_disclaimer():
+            return
         vprint("[netview] status: start")
         if self._status_running:
             return
@@ -1539,6 +1629,8 @@ class NetViewQt(QtWidgets.QMainWindow):
         self.view.setColumnWidth(2, 30)
 
     def start_tasmota_scan(self):
+        if not self.ensure_disclaimer():
+            return
         if self._tasmota_scanning:
             return
         self._tasmota_scanning = True
@@ -1850,6 +1942,8 @@ class NetViewQt(QtWidgets.QMainWindow):
                     break
 
     def start_prereq_checks(self):
+        if not self.ensure_disclaimer():
+            return
         self.prereq_model.removeRows(0, self.prereq_model.rowCount())
         tools = self.get_prereq_tools()
         self._prereq_rows = tools
@@ -2255,6 +2349,16 @@ class NetViewQt(QtWidgets.QMainWindow):
 
     def on_prereq_search_changed(self, text):
         self.prereq_proxy.set_search(text)
+
+    def on_show_disclaimer_clicked(self):
+        self._disclaimer_state = "pending"
+        ui = self._config.get("ui", {})
+        if "disclaimer_ok" in ui:
+            ui.pop("disclaimer_ok", None)
+            self._config["ui"] = ui
+            write_config(self._config)
+        self._disclaimer_shown = False
+        self.startup_tasks_with_disclaimer()
 
     def show_table_context_menu(self, pos):
         view = self.sender()
