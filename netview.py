@@ -778,12 +778,20 @@ class SortProxy(QtCore.QSortFilterProxyModel):
         if not self._search:
             return True
         model = self.sourceModel()
+        headers = [str(model.headerData(c, QtCore.Qt.Horizontal)) for c in range(model.columnCount())]
+        web_col = None
+        known_col = None
+        for i, label in enumerate(headers):
+            if label == "Web":
+                web_col = i
+            if label == "Known":
+                known_col = i
         parts = []
         for col in range(model.columnCount()):
-            if col == 1:
+            if web_col is not None and col == web_col:
                 continue
             idx = model.index(source_row, col, source_parent)
-            if col == 2:
+            if known_col is not None and col == known_col:
                 state = model.data(idx, QtCore.Qt.CheckStateRole)
                 parts.append("known" if state == QtCore.Qt.Checked else "unknown")
                 continue
@@ -1011,6 +1019,9 @@ class NetViewQt(QtWidgets.QMainWindow):
         self.status_refresh.setCurrentText("Off")
         self.status_refresh.currentIndexChanged.connect(self.on_refresh_changed)
         self.status_text = QtWidgets.QLabel("Idle")
+        self.status_search_box = QtWidgets.QLineEdit()
+        self.status_search_box.setPlaceholderText("Filter...")
+        self.status_search_box.textChanged.connect(self.on_status_search_changed)
         status_bar.addWidget(self.status_retry)
         status_bar.addWidget(QtWidgets.QLabel("Ping timeout (ms):"))
         status_bar.addWidget(self.status_timeout)
@@ -1020,13 +1031,16 @@ class NetViewQt(QtWidgets.QMainWindow):
         status_bar.addWidget(self.status_refresh)
         status_bar.addWidget(self.status_text)
         status_bar.addStretch(1)
+        status_bar.addWidget(self.status_search_box)
         status_layout.addLayout(status_bar)
 
         self.status_model = QtGui.QStandardItemModel(0, 5, self)
         self.status_model.setHorizontalHeaderLabels(["Status", "Test", "IP", "Ping", "Details"])
+        self.status_proxy = SortProxy(self)
+        self.status_proxy.setSourceModel(self.status_model)
 
         self.status_view = QtWidgets.QTableView()
-        self.status_view.setModel(self.status_model)
+        self.status_view.setModel(self.status_proxy)
         self.status_view.setSortingEnabled(True)
         self.status_view.horizontalHeader().setStretchLastSection(True)
         self.status_view.verticalHeader().setVisible(False)
@@ -1058,19 +1072,25 @@ class NetViewQt(QtWidgets.QMainWindow):
         self.tasmota_refresh_box.addItems(["Off", "2s", "5s", "10s", "15s", "20s", "30s", "60s", "2m", "5m", "10m", "30m", "1h"])
         self.tasmota_refresh_box.setCurrentText("Off")
         self.tasmota_refresh_box.currentIndexChanged.connect(self.on_tasmota_refresh_changed)
+        self.tasmota_search_box = QtWidgets.QLineEdit()
+        self.tasmota_search_box.setPlaceholderText("Filter...")
+        self.tasmota_search_box.textChanged.connect(self.on_tasmota_search_changed)
         tasmota_bar.addWidget(self.tasmota_rescan)
         tasmota_bar.addWidget(self.tasmota_refresh)
         tasmota_bar.addWidget(QtWidgets.QLabel("Auto-Refresh:"))
         tasmota_bar.addWidget(self.tasmota_refresh_box)
         tasmota_bar.addStretch(1)
+        tasmota_bar.addWidget(self.tasmota_search_box)
         tasmota_layout.addLayout(tasmota_bar)
 
         self.tasmota_model = QtGui.QStandardItemModel(0, 11, self)
         self.tasmota_model.setHorizontalHeaderLabels(
             ["Name", "State", "Switch", "Web", "IP", "Power", "Today", "Yesterday", "Total", "WiFi", "Details"]
         )
+        self.tasmota_proxy = SortProxy(self)
+        self.tasmota_proxy.setSourceModel(self.tasmota_model)
         self.tasmota_view = QtWidgets.QTableView()
-        self.tasmota_view.setModel(self.tasmota_model)
+        self.tasmota_view.setModel(self.tasmota_proxy)
         self.tasmota_view.setSortingEnabled(True)
         t_header = self.tasmota_view.horizontalHeader()
         t_header.setStretchLastSection(False)
@@ -1113,9 +1133,9 @@ class NetViewQt(QtWidgets.QMainWindow):
         devices_bar.addWidget(QtWidgets.QLabel("Auto-Refresh:"))
         devices_bar.addWidget(self.devices_refresh_box)
         devices_bar.addWidget(self.show_domain_box)
-        devices_bar.addWidget(self.search_box)
         devices_bar.addWidget(self.status)
         devices_bar.addStretch(1)
+        devices_bar.addWidget(self.search_box)
         devices_layout.addLayout(devices_bar)
 
         devices_layout.addWidget(self.view)
@@ -1127,12 +1147,22 @@ class NetViewQt(QtWidgets.QMainWindow):
         known_layout.setContentsMargins(8, 8, 8, 8)
         known_layout.setSpacing(10)
 
+        known_bar = QtWidgets.QHBoxLayout()
+        known_bar.addStretch(1)
+        self.known_search_box = QtWidgets.QLineEdit()
+        self.known_search_box.setPlaceholderText("Filter...")
+        self.known_search_box.textChanged.connect(self.on_known_search_changed)
+        known_bar.addWidget(self.known_search_box)
+        known_layout.addLayout(known_bar)
+
         self.known_model = QtGui.QStandardItemModel(0, 6, self)
         self.known_model.setHorizontalHeaderLabels(
             ["Del", "IP", "User Name", "DNS", "MAC", "Vendor"]
         )
+        self.known_proxy = SortProxy(self)
+        self.known_proxy.setSourceModel(self.known_model)
         self.known_view = QtWidgets.QTableView()
-        self.known_view.setModel(self.known_model)
+        self.known_view.setModel(self.known_proxy)
         self.known_view.setSortingEnabled(True)
         self.known_view.horizontalHeader().setStretchLastSection(True)
         self.known_view.verticalHeader().setVisible(False)
@@ -1159,8 +1189,17 @@ class NetViewQt(QtWidgets.QMainWindow):
 
         self.prereq_model = QtGui.QStandardItemModel(0, 3, self)
         self.prereq_model.setHorizontalHeaderLabels(["Status", "Tool", "Path"])
+        self.prereq_proxy = SortProxy(self)
+        self.prereq_proxy.setSourceModel(self.prereq_model)
+        prereq_bar = QtWidgets.QHBoxLayout()
+        prereq_bar.addStretch(1)
+        self.prereq_search_box = QtWidgets.QLineEdit()
+        self.prereq_search_box.setPlaceholderText("Filter...")
+        self.prereq_search_box.textChanged.connect(self.on_prereq_search_changed)
+        prereq_bar.addWidget(self.prereq_search_box)
+        prereq_layout.addLayout(prereq_bar)
         self.prereq_view = QtWidgets.QTableView()
-        self.prereq_view.setModel(self.prereq_model)
+        self.prereq_view.setModel(self.prereq_proxy)
         self.prereq_view.setSortingEnabled(True)
         self.prereq_view.horizontalHeader().setStretchLastSection(True)
         self.prereq_view.verticalHeader().setVisible(False)
@@ -2192,6 +2231,18 @@ class NetViewQt(QtWidgets.QMainWindow):
         url = item.data(QtCore.Qt.UserRole) if item else ""
         if url:
             QtGui.QDesktopServices.openUrl(QtCore.QUrl(url))
+
+    def on_status_search_changed(self, text):
+        self.status_proxy.set_search(text)
+
+    def on_tasmota_search_changed(self, text):
+        self.tasmota_proxy.set_search(text)
+
+    def on_known_search_changed(self, text):
+        self.known_proxy.set_search(text)
+
+    def on_prereq_search_changed(self, text):
+        self.prereq_proxy.set_search(text)
 
     def show_table_context_menu(self, pos):
         view = self.sender()
