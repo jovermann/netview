@@ -975,9 +975,20 @@ class WireCubeWidget(QtWidgets.QWidget):
                 front_edges.add(tuple(sorted((d, a))))
         buf_painter = QtGui.QPainter(self._buffer)
         buf_painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
-        buf_painter.setCompositionMode(QtGui.QPainter.CompositionMode_SourceAtop)
-        buf_painter.fillRect(self._buffer.rect(), QtGui.QColor(self._bg.red(), self._bg.green(), self._bg.blue(), 26))
         buf_painter.setCompositionMode(QtGui.QPainter.CompositionMode_SourceOver)
+        blur_alpha = 32
+        offsets = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]
+        center = QtCore.QPointF(self._buffer.width() * 0.5, self._buffer.height() * 0.5)
+        for dx, dy in offsets:
+            buf_painter.setOpacity(blur_alpha / 255.0)
+            buf_painter.save()
+            buf_painter.translate(center)
+            buf_painter.rotate(0.5)
+            buf_painter.scale(1.03, 1.03)
+            buf_painter.translate(-center)
+            buf_painter.drawImage(dx, dy, self._buffer)
+            buf_painter.restore()
+        buf_painter.setOpacity(1.0)
         color = QtGui.QColor()
         color.setHsv(int(self._hue), 200, 220)
         pen = QtGui.QPen(color, 1.5)
