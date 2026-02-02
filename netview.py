@@ -833,6 +833,8 @@ class WireCubeWidget(QtWidgets.QWidget):
         self._ax = 0.0
         self._ay = 0.0
         self._az = 0.0
+        self._hold_zero = False
+        self._hue = 0.0
         self._bg = QtGui.QColor("#FFFFFF")
         self._line = QtGui.QColor("#6E6E73")
         self._buffer = None
@@ -847,6 +849,13 @@ class WireCubeWidget(QtWidgets.QWidget):
         self.update()
 
     def _tick(self):
+        self._hue = (self._hue + 2.0) % 360.0
+        if self._hold_zero:
+            self._ax = 0.0
+            self._ay = 0.0
+            self._az = 0.0
+            self.update()
+            return
         self._ax = (self._ax + 1.3) % 360.0
         self._ay = (self._ay + 0.9) % 360.0
         self._az = (self._az + 1.1) % 360.0
@@ -857,6 +866,25 @@ class WireCubeWidget(QtWidgets.QWidget):
             return
         self._buffer = QtGui.QImage(self.size(), QtGui.QImage.Format_ARGB32)
         self._buffer.fill(self._bg)
+
+    def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.LeftButton:
+            self._ax = 0.0
+            self._ay = 0.0
+            self._az = 0.0
+            self._hold_zero = True
+            self._reset_buffer()
+            self.update()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == QtCore.Qt.LeftButton:
+            self._hold_zero = False
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def resizeEvent(self, event):
         self._reset_buffer()
@@ -950,12 +978,99 @@ class WireCubeWidget(QtWidgets.QWidget):
         buf_painter.setCompositionMode(QtGui.QPainter.CompositionMode_SourceAtop)
         buf_painter.fillRect(self._buffer.rect(), QtGui.QColor(self._bg.red(), self._bg.green(), self._bg.blue(), 26))
         buf_painter.setCompositionMode(QtGui.QPainter.CompositionMode_SourceOver)
-        pen = QtGui.QPen(self._line, 1.5)
+        color = QtGui.QColor()
+        color.setHsv(int(self._hue), 200, 220)
+        pen = QtGui.QPen(color, 1.5)
         buf_painter.setPen(pen)
         for a, b in edges:
             if tuple(sorted((a, b))) not in front_edges:
                 continue
             buf_painter.drawLine(projected[a], projected[b])
+        buf_painter.setClipRect(self._buffer.rect())
+        text_color = QtGui.QColor()
+        text_color.setHsv(int((self._hue + 180.0) % 360.0), 200, 220)
+        text_pen = QtGui.QPen(text_color, 1.0)
+        buf_painter.setPen(text_pen)
+        buf_painter.setBrush(QtCore.Qt.NoBrush)
+
+        def strokes_for_text():
+            # Simple vector strokes in a 7x7 grid, normalized to [-0.5, 0.5].
+            # Each letter is defined as line segments in local 0..1 box.
+            letters = {
+                "n": [((0.1, 0.8), (0.1, 0.2)), ((0.1, 0.2), (0.5, 0.2)), ((0.5, 0.2), (0.5, 0.8))],
+                "e": [((0.6, 0.2), (0.1, 0.2)), ((0.1, 0.2), (0.1, 0.8)), ((0.1, 0.5), (0.5, 0.5)), ((0.1, 0.8), (0.6, 0.8))],
+                "t": [((0.1, 0.2), (0.9, 0.2)), ((0.5, 0.2), (0.5, 0.8))],
+                "v": [((0.1, 0.2), (0.5, 0.8)), ((0.9, 0.2), (0.5, 0.8))],
+                "i": [((0.5, 0.3), (0.5, 0.8)), ((0.5, 0.2), (0.5, 0.2))],
+                "w": [((0.1, 0.2), (0.3, 0.8)), ((0.3, 0.8), (0.5, 0.2)), ((0.5, 0.2), (0.7, 0.8)), ((0.7, 0.8), (0.9, 0.2))],
+            }
+            word = "netview"
+            segments = []
+            x = 0.0
+            advance = 1.0
+            for ch in word:
+                segs = letters.get(ch, [])
+                for (x1, y1), (x2, y2) in segs:
+                    segments.append(((x + x1, y1), (x + x2, y2)))
+                x += advance
+            # Center horizontally and vertically in unit box.
+            total_w = max(1.0, x)
+            out = []
+            for (x1, y1), (x2, y2) in segments:
+                nx1 = (x1 / total_w) - 0.5
+                ny1 = y1 - 0.5
+                nx2 = (x2 / total_w) - 0.5
+                ny2 = y2 - 0.5
+                out.append(((nx1, ny1), (nx2, ny2)))
+            return out
+
+        text_strokes = strokes_for_text()
+        for face in faces:
+            a, b, c, d = face
+            pa = rotated[a]
+            pb = rotated[b]
+            pc = rotated[c]
+            ab = (pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2])
+            ac = (pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2])
+            normal = (
+                ab[1] * ac[2] - ab[2] * ac[1],
+                ab[2] * ac[0] - ab[0] * ac[2],
+                ab[0] * ac[1] - ab[1] * ac[0],
+            )
+            center = (
+                (rotated[a][0] + rotated[b][0] + rotated[c][0] + rotated[d][0]) / 4.0,
+                (rotated[a][1] + rotated[b][1] + rotated[c][1] + rotated[d][1]) / 4.0,
+                (rotated[a][2] + rotated[b][2] + rotated[c][2] + rotated[d][2]) / 4.0,
+            )
+            view = (0.0 - center[0], 0.0 - center[1], 3.5 - center[2])
+            dot = normal[0] * view[0] + normal[1] * view[1] + normal[2] * view[2]
+            if dot <= 0:
+                continue
+            u2 = QtCore.QPointF(projected[b].x() - projected[a].x(),
+                                projected[b].y() - projected[a].y())
+            v2 = QtCore.QPointF(projected[d].x() - projected[a].x(),
+                                projected[d].y() - projected[a].y())
+            ulen = math.hypot(u2.x(), u2.y())
+            vlen = math.hypot(v2.x(), v2.y())
+            face_scale = 0.5 * min(ulen, vlen)
+            if face_scale <= 0 or ulen == 0 or vlen == 0:
+                continue
+            udir = QtCore.QPointF(u2.x() / ulen, u2.y() / ulen)
+            vdir = QtCore.QPointF(v2.x() / vlen, v2.y() / vlen)
+            center2d = QtCore.QPointF(
+                (projected[a].x() + projected[b].x() + projected[c].x() + projected[d].x()) * 0.25,
+                (projected[a].y() + projected[b].y() + projected[c].y() + projected[d].y()) * 0.25,
+            )
+            for (x1, y1), (x2, y2) in text_strokes:
+                p1 = QtCore.QPointF(
+                    center2d.x() + (udir.x() * x1 + vdir.x() * y1) * face_scale,
+                    center2d.y() + (udir.y() * x1 + vdir.y() * y1) * face_scale,
+                )
+                p2 = QtCore.QPointF(
+                    center2d.x() + (udir.x() * x2 + vdir.x() * y2) * face_scale,
+                    center2d.y() + (udir.y() * x2 + vdir.y() * y2) * face_scale,
+                )
+                buf_painter.drawLine(p1, p2)
         buf_painter.end()
         painter.drawImage(0, 0, self._buffer)
 
@@ -978,6 +1093,12 @@ class AboutBackdropWidget(QtWidgets.QWidget):
     def resizeEvent(self, event):
         self.cube.setGeometry(self.rect())
         return super().resizeEvent(event)
+
+    def mousePressEvent(self, event):
+        self.cube.mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self.cube.mouseReleaseEvent(event)
 
 
 class ScanWorker(QtCore.QObject):
@@ -1423,6 +1544,7 @@ class NetViewQt(QtWidgets.QMainWindow):
         self.about_info.setTextFormat(QtCore.Qt.RichText)
         self.about_info.setTextInteractionFlags(QtCore.Qt.TextBrowserInteraction)
         self.about_info.setOpenExternalLinks(True)
+        self.about_info.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
         self.about_info.setText(about_text)
         self.about_info.setWordWrap(True)
         self.about_info.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
