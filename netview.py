@@ -830,9 +830,12 @@ class SortProxy(QtCore.QSortFilterProxyModel):
 class WireCubeWidget(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._angle = 0.0
+        self._ax = 0.0
+        self._ay = 0.0
+        self._az = 0.0
         self._bg = QtGui.QColor("#FFFFFF")
         self._line = QtGui.QColor("#6E6E73")
+        self._buffer = None
         self._timer = QtCore.QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._timer.start(30)
@@ -840,25 +843,38 @@ class WireCubeWidget(QtWidgets.QWidget):
     def set_colors(self, bg, line):
         self._bg = QtGui.QColor(bg)
         self._line = QtGui.QColor(line)
+        self._reset_buffer()
         self.update()
 
     def _tick(self):
-        self._angle = (self._angle + 1.5) % 360.0
+        self._ax = (self._ax + 1.3) % 360.0
+        self._ay = (self._ay + 0.9) % 360.0
+        self._az = (self._az + 1.1) % 360.0
         self.update()
 
+    def _reset_buffer(self):
+        if self.width() <= 0 or self.height() <= 0:
+            return
+        self._buffer = QtGui.QImage(self.size(), QtGui.QImage.Format_ARGB32)
+        self._buffer.fill(self._bg)
+
+    def resizeEvent(self, event):
+        self._reset_buffer()
+        return super().resizeEvent(event)
+
     def paintEvent(self, event):
+        if self._buffer is None or self._buffer.size() != self.size():
+            self._reset_buffer()
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
-        painter.fillRect(self.rect(), self._bg)
         w = max(1, self.width())
         h = max(1, self.height())
         size = min(w, h) * 0.175
         cx = w * 0.5
         cy = h * 0.5
-        angle = self._angle * math.pi / 180.0
-        ax = angle
-        ay = angle * 0.8
-        az = angle * 1.1
+        ax = self._ax * math.pi / 180.0
+        ay = self._ay * math.pi / 180.0
+        az = self._az * math.pi / 180.0
         points = [
             (-1, -1, -1),
             (1, -1, -1),
@@ -896,12 +912,52 @@ class WireCubeWidget(QtWidgets.QWidget):
             (4, 5), (5, 6), (6, 7), (7, 4),
             (0, 4), (1, 5), (2, 6), (3, 7),
         ]
+        faces = [
+            (0, 3, 2, 1),  # back (-z)
+            (4, 5, 6, 7),  # front (+z)
+            (0, 4, 7, 3),  # left (-x)
+            (1, 2, 6, 5),  # right (+x)
+            (0, 1, 5, 4),  # bottom (-y)
+            (3, 7, 6, 2),  # top (+y)
+        ]
+        front_edges = set()
+        for face in faces:
+            a, b, c, d = face
+            pa = rotated[a]
+            pb = rotated[b]
+            pc = rotated[c]
+            ab = (pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2])
+            ac = (pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2])
+            normal = (
+                ab[1] * ac[2] - ab[2] * ac[1],
+                ab[2] * ac[0] - ab[0] * ac[2],
+                ab[0] * ac[1] - ab[1] * ac[0],
+            )
+            center = (
+                (rotated[a][0] + rotated[b][0] + rotated[c][0] + rotated[d][0]) / 4.0,
+                (rotated[a][1] + rotated[b][1] + rotated[c][1] + rotated[d][1]) / 4.0,
+                (rotated[a][2] + rotated[b][2] + rotated[c][2] + rotated[d][2]) / 4.0,
+            )
+            view = (0.0 - center[0], 0.0 - center[1], 3.5 - center[2])
+            dot = normal[0] * view[0] + normal[1] * view[1] + normal[2] * view[2]
+            if dot > 0:
+                front_edges.add(tuple(sorted((a, b))))
+                front_edges.add(tuple(sorted((b, c))))
+                front_edges.add(tuple(sorted((c, d))))
+                front_edges.add(tuple(sorted((d, a))))
+        buf_painter = QtGui.QPainter(self._buffer)
+        buf_painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        buf_painter.setCompositionMode(QtGui.QPainter.CompositionMode_SourceAtop)
+        buf_painter.fillRect(self._buffer.rect(), QtGui.QColor(self._bg.red(), self._bg.green(), self._bg.blue(), 26))
+        buf_painter.setCompositionMode(QtGui.QPainter.CompositionMode_SourceOver)
         pen = QtGui.QPen(self._line, 1.5)
-        painter.setPen(pen)
+        buf_painter.setPen(pen)
         for a, b in edges:
-            if (rotated[a][2] + rotated[b][2]) / 2.0 < 0:
+            if tuple(sorted((a, b))) not in front_edges:
                 continue
-            painter.drawLine(projected[a], projected[b])
+            buf_painter.drawLine(projected[a], projected[b])
+        buf_painter.end()
+        painter.drawImage(0, 0, self._buffer)
 
 
 class AboutBackdropWidget(QtWidgets.QWidget):
