@@ -9,9 +9,12 @@ import queue
 import re
 import shutil
 import socket
+import statistics
 import subprocess
 import threading
+import time
 import urllib.request
+import urllib.parse
 import urllib.error
 from pathlib import Path
 import tomllib
@@ -1112,6 +1115,66 @@ class AboutBackdropWidget(QtWidgets.QWidget):
         self.cube.mouseReleaseEvent(event)
 
 
+class SpeedtestGraph(QtWidgets.QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._data = []
+        self._duration = 10.0
+        self._max_mbps = 1.0
+        self._grid_color = QtGui.QColor("#B0B0B0")
+        self._down_color = QtGui.QColor("#F2C94C")
+        self._inst_color = QtGui.QColor("#F2994A")
+        self._label_color = QtGui.QColor("#6E6E73")
+        self.setMinimumHeight(220)
+
+    def reset(self, duration):
+        self._data = []
+        self._duration = max(1.0, float(duration))
+        self._max_mbps = 1.0
+        self.update()
+
+    def add_point(self, t, avg_mbps, inst_mbps):
+        self._data.append((t, avg_mbps, inst_mbps))
+        self._max_mbps = max(self._max_mbps, avg_mbps, inst_mbps, 1.0)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        rect = self.rect().adjusted(10, 10, -10, -10)
+        painter.fillRect(rect, self.palette().color(QtGui.QPalette.Base))
+        grid_pen = QtGui.QPen(self._grid_color)
+        grid_pen.setStyle(QtCore.Qt.DashLine)
+        painter.setPen(grid_pen)
+        for i in range(1, 5):
+            x = rect.left() + rect.width() * i / 5.0
+            y = rect.top() + rect.height() * i / 5.0
+            painter.drawLine(QtCore.QPointF(x, rect.top()), QtCore.QPointF(x, rect.bottom()))
+            painter.drawLine(QtCore.QPointF(rect.left(), y), QtCore.QPointF(rect.right(), y))
+        painter.setPen(QtGui.QPen(self._label_color))
+        painter.drawText(rect.left() + 6, rect.top() + 16, f"{int(self._max_mbps)} Mbps")
+        painter.drawText(rect.right() - 60, rect.bottom() - 6, f"{int(self._duration)}s")
+
+        def draw_series(idx, color):
+            if len(self._data) < 2:
+                return
+            pen = QtGui.QPen(color, 2.0)
+            painter.setPen(pen)
+            path = QtGui.QPainterPath()
+            for i, (t, avg, inst) in enumerate(self._data):
+                val = avg if idx == 0 else inst
+                x = rect.left() + (t / self._duration) * rect.width()
+                y = rect.bottom() - (val / self._max_mbps) * rect.height()
+                if i == 0:
+                    path.moveTo(x, y)
+                else:
+                    path.lineTo(x, y)
+            painter.drawPath(path)
+
+        draw_series(0, self._down_color)
+        draw_series(1, self._inst_color)
+
+
 class ScanWorker(QtCore.QObject):
     upsert = QtCore.Signal(str, str, str, str)
     merge_identity = QtCore.Signal(str, str, str)
@@ -1228,6 +1291,87 @@ class ScanWorker(QtCore.QObject):
                     fut.add_done_callback(lambda f, ip=ip: self.update_ports.emit(ip, safe_result(f, default=[])))
 
 
+class SpeedtestWorker(QtCore.QObject):
+    status = QtCore.Signal(str)
+    ping = QtCore.Signal(str)
+    point = QtCore.Signal(float, float, float)
+    finished = QtCore.Signal(str)
+
+    def __init__(self, duration_s, server_url, sample_interval, parent=None):
+        super().__init__(parent)
+        self.duration_s = duration_s
+        self.server_url = server_url
+        self.sample_interval = max(0.001, float(sample_interval))
+
+    def start(self):
+        t = threading.Thread(target=self.run, daemon=True)
+        t.start()
+
+    def run(self):
+        vprint(f"[speedtest] url={self.server_url} duration={self.duration_s}s")
+        self.status.emit("Pinging...")
+        ping_ms = self._measure_ping()
+        self.ping.emit(f"{ping_ms:.1f} ms" if ping_ms is not None else "n/a")
+        self.status.emit("Download...")
+        avg = self._run_download()
+        if avg is None:
+            self.status.emit("Download failed")
+            self.finished.emit("failed")
+            return
+        self.finished.emit(f"{avg:.2f} Mbps")
+
+    def _measure_ping(self):
+        host = urllib.parse.urlparse(self.server_url).hostname or ""
+        if not host:
+            return None
+        try:
+            ok, ms, _ip = ping_host_timed(host, timeout_ms=1000)
+            if ok and ms:
+                return float(ms.replace(" ms", ""))
+        except Exception:
+            pass
+        vprint("[speedtest] ping failed")
+        return None
+
+    def _run_download(self):
+        start_time = time.time()
+        end_time = start_time + self.duration_s
+        url = self.server_url
+        vprint(f"[speedtest] download url={url}")
+        total_bytes = 0
+        sample_interval = self.sample_interval
+        last_sample_time = start_time
+        last_sample_bytes = 0
+        next_sample_time = start_time + sample_interval
+        while time.time() < end_time:
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "netview"})
+                with urllib.request.urlopen(req, timeout=10.0) as resp:
+                    while True:
+                        chunk = resp.read(256 * 1024)
+                        if not chunk:
+                            break
+                        total_bytes += len(chunk)
+                        now = time.time()
+                        if now >= next_sample_time:
+                            elapsed = now - start_time
+                            avg_mbps = (total_bytes * 8.0) / max(elapsed, 1e-6) / 1_000_000.0
+                            delta_time = now - last_sample_time
+                            delta_bytes = total_bytes - last_sample_bytes
+                            inst_mbps = (delta_bytes * 8.0) / max(delta_time, 1e-6) / 1_000_000.0
+                            self.point.emit(min(elapsed, self.duration_s), avg_mbps, inst_mbps)
+                            last_sample_time = now
+                            last_sample_bytes = total_bytes
+                            next_sample_time = now + sample_interval
+                        if time.time() >= end_time:
+                            break
+            except Exception as e:
+                vprint(f"[speedtest] download failed: {e!r}")
+                return None
+        avg_mbps = (total_bytes * 8.0) / max(self.duration_s, 1e-6) / 1_000_000.0
+        return avg_mbps
+
+
 class NetViewQt(QtWidgets.QMainWindow):
     status_row_update = QtCore.Signal(int, bool, str, str, str)
     status_summary = QtCore.Signal(str)
@@ -1275,6 +1419,7 @@ class NetViewQt(QtWidgets.QMainWindow):
         self._tab_index_devices = None
         self._tab_index_known = None
         self._tab_index_about = None
+        self._tab_index_speedtest = None
         self._tab_index_tasmota = None
         self._tab_index_prereq = None
 
@@ -1528,6 +1673,49 @@ class NetViewQt(QtWidgets.QMainWindow):
         prereq_layout.addWidget(self.prereq_view)
         self._tab_index_prereq = self.tabs.addTab(prereq_tab, "Prerequisites")
 
+        speed_tab = QtWidgets.QWidget()
+        speed_layout = QtWidgets.QVBoxLayout(speed_tab)
+        speed_layout.setContentsMargins(8, 8, 8, 8)
+        speed_layout.setSpacing(10)
+
+        speed_bar = QtWidgets.QHBoxLayout()
+        self.speed_start = QtWidgets.QPushButton("Start")
+        self.speed_start.clicked.connect(self.on_speedtest_start)
+        self.speed_duration = QtWidgets.QComboBox()
+        self.speed_duration.addItems(["1s", "2s", "5s", "10s", "20s", "30s", "1m", "2m", "5m", "10m", "20m", "1h", "2h", "4h", "6h", "12h", "24h"])
+        self.speed_duration.setCurrentText("10s")
+        self.speed_granularity = QtWidgets.QComboBox()
+        self.speed_granularity.addItems(["20ms", "50ms", "100ms", "200ms", "500ms", "1s", "2s", "5s", "10s"])
+        self.speed_granularity.setCurrentText("200ms")
+        self.speed_server = QtWidgets.QComboBox()
+        self.speed_server.addItem("fsn1-speed.hetzner.com (10GB)", "https://fsn1-speed.hetzner.com/10GB.bin")
+        self.speed_server.addItem("hel1-speed.hetzner.com (10GB)", "https://hel1-speed.hetzner.com/10GB.bin")
+        self.speed_server.addItem("speed.hetzner.de (10GB)", "https://speed.hetzner.de/10GB.bin")
+        self.speed_server.addItem("ash.icmp.hetzner.com (10GB)", "http://ash.icmp.hetzner.com/10GB.bin")
+        self.speed_server.addItem("hil.icmp.hetzner.com (10GB)", "http://hil.icmp.hetzner.com/10GB.bin")
+        self.speed_ping = QtWidgets.QLabel("Ping: n/a")
+        self.speed_status = QtWidgets.QLineEdit("Idle")
+        self.speed_status.setReadOnly(True)
+        self.speed_status.setMinimumWidth(360)
+        speed_bar.addWidget(self.speed_start)
+        speed_bar.addWidget(QtWidgets.QLabel("Duration:"))
+        speed_bar.addWidget(self.speed_duration)
+        speed_bar.addWidget(QtWidgets.QLabel("Sample:"))
+        speed_bar.addWidget(self.speed_granularity)
+        speed_bar.addWidget(QtWidgets.QLabel("Server:"))
+        speed_bar.addWidget(self.speed_server)
+        speed_bar.addStretch(1)
+        speed_bar.addWidget(self.speed_ping)
+        speed_bar.addWidget(self.speed_status)
+        speed_layout.addLayout(speed_bar)
+
+        self.speed_graph = SpeedtestGraph()
+        self.speed_graph.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        speed_layout.addWidget(self.speed_graph, 1)
+        speed_layout.setStretch(0, 0)
+        speed_layout.setStretch(1, 1)
+        self._tab_index_speedtest = self.tabs.addTab(speed_tab, "Speedtest")
+
         about_tab = QtWidgets.QWidget()
         about_layout = QtWidgets.QVBoxLayout(about_tab)
         about_layout.setContentsMargins(8, 8, 8, 8)
@@ -1654,6 +1842,11 @@ class NetViewQt(QtWidgets.QMainWindow):
         self._known_programmatic = 0
         self._name_programmatic = 0
         self._known_devices_updating = False
+        self._speedtest_worker = None
+        self._speedtest_servers_loaded = True
+        self._speedtest_duration = 10.0
+        self._speedtest_max_inst = 0.0
+        self._speedtest_inst_values = []
         ui_cfg = self._config.get("ui", {})
         self._disclaimer_state = "accepted" if ui_cfg.get("disclaimer_ok") == "On" else "pending"
         self._disclaimer_shown = False
@@ -1816,6 +2009,8 @@ class NetViewQt(QtWidgets.QMainWindow):
             if not self._tasmota_rows:
                 self.start_tasmota_scan()
             self.apply_tasmota_auto_refresh()
+        elif index == self._tab_index_speedtest:
+            pass
         elif index == self._tab_index_prereq:
             self.start_prereq_checks()
         self.schedule_config_write()
@@ -2699,6 +2894,69 @@ class NetViewQt(QtWidgets.QMainWindow):
             write_config(self._config)
         self._disclaimer_shown = False
         self.startup_tasks_with_disclaimer()
+
+    def load_speedtest_servers(self):
+        return
+
+    def _parse_duration_seconds(self, text):
+        t = text.strip().lower()
+        if t.endswith("ms"):
+            return float(t[:-2]) / 1000.0
+        if t.endswith("s"):
+            return float(t[:-1])
+        if t.endswith("m"):
+            return float(t[:-1]) * 60.0
+        if t.endswith("h"):
+            return float(t[:-1]) * 3600.0
+        try:
+            return float(t)
+        except Exception:
+            return 10.0
+
+    def on_speedtest_start(self):
+        if not self.ensure_disclaimer():
+            return
+        if self._speedtest_worker is not None:
+            return
+        duration = self._parse_duration_seconds(self.speed_duration.currentText())
+        sample_interval = self._parse_duration_seconds(self.speed_granularity.currentText())
+        self.speed_graph.reset(duration)
+        self.speed_ping.setText("Ping: n/a")
+        self.speed_status.setText("Starting...")
+        self.speed_start.setEnabled(False)
+        server_url = self.speed_server.currentData()
+        self._speedtest_duration = duration
+        self._speedtest_max_inst = 0.0
+        self._speedtest_inst_values = []
+        worker = SpeedtestWorker(duration, server_url, sample_interval)
+        worker.ping.connect(lambda s: self.speed_ping.setText(f"Ping: {s}"))
+        worker.point.connect(self.on_speedtest_point)
+        worker.finished.connect(self.on_speedtest_finished)
+        self._speedtest_worker = worker
+        worker.start()
+
+    def on_speedtest_point(self, t, down, up):
+        self._speedtest_inst_values.append(up)
+        median_mbps = statistics.median(self._speedtest_inst_values)
+        self.speed_graph.add_point(t, median_mbps, up)
+        if up > self._speedtest_max_inst:
+            self._speedtest_max_inst = up
+        self.speed_status.setText(
+            f"Med={median_mbps:.1f} (Avg={down:.1f} Max={self._speedtest_max_inst:.1f})"
+        )
+
+    def on_speedtest_finished(self, result):
+        self._speedtest_worker = None
+        if result and result != "failed":
+            try:
+                avg = float(result.replace(" Mbps", ""))
+                median_mbps = statistics.median(self._speedtest_inst_values) if self._speedtest_inst_values else 0.0
+                self.speed_status.setText(
+                    f"Med={median_mbps:.1f} (Avg={avg:.1f} Max={self._speedtest_max_inst:.1f})"
+                )
+            except Exception:
+                self.speed_status.setText(f"Done: {result}")
+        self.speed_start.setEnabled(True)
 
     def show_table_context_menu(self, pos):
         view = self.sender()
